@@ -247,7 +247,7 @@ def cmd_login(args, db: Database) -> int:
     except AuthError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, EOFError):
         print("\n(aborted)", file=sys.stderr)
         return 130
 

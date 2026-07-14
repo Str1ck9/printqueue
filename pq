@@ -1,16 +1,20 @@
 #!/usr/bin/env python3
 """PrintQueue launcher — runs the CLI from a source checkout.
 
-Prefers the project's .venv interpreter (where bambu-lab-cloud-api lives)
-when it exists and we're not already running inside it.
+Re-execs into the project's .venv interpreter (where bambu-lab-cloud-api
+lives) unless we're already running inside it. NOTE: compare sys.prefix,
+not executable paths — the venv's python3 is a symlink to the system
+binary, so realpath(sys.executable) can't tell the two apart.
 """
 import os
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+VENV = os.path.join(HERE, ".venv")
+VENV_PY = os.path.join(VENV, "bin", "python3")
 
-VENV_PY = os.path.join(HERE, ".venv", "bin", "python3")
-if os.path.exists(VENV_PY) and os.path.realpath(sys.executable) != os.path.realpath(VENV_PY):
+in_venv = os.path.abspath(sys.prefix) == os.path.abspath(VENV)
+if os.path.exists(VENV_PY) and not in_venv:
     os.execv(VENV_PY, [VENV_PY, os.path.abspath(__file__)] + sys.argv[1:])
 
 # Ensure we can import the local package regardless of CWD

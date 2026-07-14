@@ -63,9 +63,11 @@ def _import_bambulab():
     try:
         from bambulab.auth import BambuAuthenticator, BambuAuthError
         from bambulab.client import BambuClient
-    except Exception as exc:  # ImportError or transitive failure
+    except ImportError as exc:
         raise AuthError(
-            "bambu-lab-cloud-api not installed — run: "
+            "bambu-lab-cloud-api is not importable from this interpreter "
+            f"({sys.executable}): {exc}\n"
+            "It is installed in the project .venv — run via ./pq, or: "
             "pip install bambu-lab-cloud-api"
         ) from exc
     return BambuAuthenticator, BambuAuthError, BambuClient
