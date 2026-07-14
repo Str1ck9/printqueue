@@ -105,6 +105,13 @@ class HistoryPanel(Container):
         yield table
 
 
+class CameraPanel(Static):
+    """Live chamber-camera view (rendered as half-block pixels)."""
+
+    def on_mount(self) -> None:
+        self.update("[bold cyan]Camera[/bold cyan]\n\n  connecting…")
+
+
 class PrintQueueApp(App):
     """Main Textual application."""
 
@@ -124,6 +131,13 @@ class PrintQueueApp(App):
         width: 40%;
         border: round cyan;
         padding: 1 2;
+    }
+    CameraPanel {
+        width: 36%;
+        height: 100%;
+        border: round blue;
+        padding: 0 1;
+        display: none;
     }
     QueuePanel {
         width: 60%;
@@ -155,22 +169,28 @@ class PrintQueueApp(App):
         Binding("d", "done_selected", "Mark Done"),
         Binding("x", "delete_selected", "Delete Job"),
         Binding("a", "sync_ams", "Sync AMS"),
+        Binding("c", "toggle_camera", "Camera"),
     ]
 
     TITLE = "PrintQueue — Bambu P1S"
 
-    def __init__(self, db: Database, client: BambuCloudClient, poll_seconds: float = 5.0):
+    def __init__(self, db: Database, client: BambuCloudClient,
+                 poll_seconds: float = 5.0, cfg=None):
         super().__init__()
         self.db = db
         self.client = client
+        self.cfg = cfg
         self.poll_seconds = poll_seconds
         # (job_id, monotonic timestamp) of a pending delete confirmation
         self._pending_delete: Optional[tuple[int, float]] = None
+        self._camera_stream = None       # printqueue.camera.CameraStream
+        self._camera_frame_ts: float = 0.0
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
         with Horizontal(id="top"):
             yield PrinterPanel(id="printer")
+            yield CameraPanel(id="camera")
             yield QueuePanel(id="queue")
         with Horizontal(id="bottom"):
             yield FilamentPanel(id="filament")
@@ -183,8 +203,15 @@ class PrintQueueApp(App):
         self.set_interval(self.poll_seconds, self.poll_printer)
         # periodically refresh tables so jobs added elsewhere appear
         self.set_interval(15.0, self.refresh_tables)
+        # camera frame refresh (no-op while the panel is hidden)
+        self.set_interval(1.0, self._update_camera)
         # initial poll right away
         await self.poll_printer()
+
+    def on_unmount(self) -> None:
+        if self._camera_stream is not None:
+            self._camera_stream.stop()
+        self.client.close()
 
     async def poll_printer(self) -> None:
         panel = self.query_one(PrinterPanel)
@@ -304,6 +331,79 @@ class PrintQueueApp(App):
         self._pending_delete = (job_id, time.monotonic())
         self.notify(f"Press x again to delete job {job_id}", severity="warning")
 
+    # -- camera ---------------------------------------------------------------
+    def action_toggle_camera(self) -> None:
+        cam = self.query_one(CameraPanel)
+        printer = self.query_one(PrinterPanel)
+        if cam.display:
+            cam.display = False
+            printer.styles.width = "40%"
+            if self._camera_stream is not None:
+                self._camera_stream.stop()
+                self._camera_stream = None
+            return
+        cam.display = True
+        printer.styles.width = "24%"
+        cam.update("[bold cyan]Camera[/bold cyan]\n\n  connecting…")
+        self.run_worker(self._start_camera, thread=True, exclusive=True,
+                        group="camera")
+
+    def _start_camera(self) -> None:
+        """Resolve LAN target and start the frame reader (worker thread)."""
+        from .camera import CameraError, CameraStream, resolve_camera_target
+        try:
+            if self.cfg is None:
+                from .config import load_config
+                self.cfg = load_config()
+            lan_ip, access_code = resolve_camera_target(self.cfg, self.client)
+        except CameraError as exc:
+            self.call_from_thread(self._camera_failed, str(exc))
+            return
+        stream = CameraStream(lan_ip, access_code)
+        stream.start()
+        self._camera_stream = stream
+
+    def _camera_failed(self, msg: str) -> None:
+        cam = self.query_one(CameraPanel)
+        cam.update(f"[bold cyan]Camera[/bold cyan]\n\n  [red]✗[/red] {msg}")
+        self.notify("Camera unavailable", severity="warning")
+
+    def _update_camera(self) -> None:
+        """Render the newest frame into the panel (called every second)."""
+        cam = self.query_one(CameraPanel)
+        stream = self._camera_stream
+        if not cam.display or stream is None:
+            return
+        frame = stream.frame
+        if frame is None:
+            if stream.error:
+                cam.update(f"[bold cyan]Camera[/bold cyan]\n\n"
+                           f"  [red]✗[/red] {stream.error}")
+            return
+        if stream._frame_ts == self._camera_frame_ts:
+            return  # nothing new
+        try:
+            import io
+            from PIL import Image
+            from rich_pixels import Pixels
+        except ImportError as exc:
+            cam.update(f"[bold cyan]Camera[/bold cyan]\n\n"
+                       f"  [red]✗[/red] render deps missing: {exc}\n"
+                       f"  pip install rich-pixels pillow")
+            return
+        size = cam.content_size
+        if size.width < 4 or size.height < 3:
+            return
+        img = Image.open(io.BytesIO(frame))
+        # 1 cell = 1px wide x 2px tall (half-block rendering); leave a title row
+        max_w, max_h = size.width, (size.height - 1) * 2
+        scale = min(max_w / img.width, max_h / img.height)
+        img = img.resize((max(1, int(img.width * scale)),
+                          max(1, int(img.height * scale))),
+                         Image.Resampling.LANCZOS)
+        self._camera_frame_ts = stream._frame_ts
+        cam.update(Pixels.from_image(img))
+
     def action_sync_ams(self) -> None:
         """Reconcile filament inventory with the AMS trays from the last poll."""
         panel = self.query_one(PrinterPanel)
@@ -318,5 +418,5 @@ class PrintQueueApp(App):
         self.notify(f"AMS synced: {len(results)} tray(s), {added} new spool(s)")
 
 
-def run_dashboard(db: Database, client: BambuCloudClient) -> None:
-    PrintQueueApp(db=db, client=client).run()
+def run_dashboard(db: Database, client: BambuCloudClient, cfg=None) -> None:
+    PrintQueueApp(db=db, client=client, cfg=cfg).run()

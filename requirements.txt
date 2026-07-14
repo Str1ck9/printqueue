@@ -1,4 +1,8 @@
 textual>=0.47.0
-# Cloud auth + device list + MQTT telemetry (AGPL-3.0; pulls paho-mqtt,
-# requests, and — for features we don't use — flask + opencv-python).
+# Cloud auth + device list + MQTT telemetry + camera protocol (AGPL-3.0;
+# pulls paho-mqtt, requests, and — for features we don't use — flask +
+# opencv-python).
 bambu-lab-cloud-api==1.0.5
+# Camera rendering in the TUI (half-block pixel images)
+rich-pixels>=3.0
+pillow>=10.0

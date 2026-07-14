@@ -85,6 +85,7 @@ When the database file is created for the first time, James's default filament s
 | `pq inventory set <filament_id> <grams>` | Set remaining grams (absolute — e.g. after weighing) |
 | `pq inventory remove <filament_id>` | Remove a spool |
 | `pq status` | One-shot printer poll (Bambu Cloud) |
+| `pq camera [-o out.jpg]` | Save a chamber-camera snapshot (LAN, 1280x720) |
 | `pq history [--limit N] [--csv]` | Recent prints (CSV export supported) |
 | `pq dashboard` | Launch the Textual TUI |
 | `pq login [--region global|china]` | Interactive Bambu Cloud login (saves token) |
@@ -113,7 +114,7 @@ Global: `--db PATH` to override the SQLite location.
 └──────────────────────┴──────────────────────────────────┘
 ```
 
-Keys: `q` quit · `r` refresh · `s` start job · `d` mark done · `x` twice to delete (confirmation) · `a` sync AMS → inventory · arrows to navigate.
+Keys: `q` quit · `r` refresh · `s` start job · `d` mark done · `x` twice to delete (confirmation) · `a` sync AMS → inventory · `c` toggle live camera · arrows to navigate.
 
 ### AMS inventory sync
 
@@ -196,11 +197,24 @@ management work fully offline regardless. Only the **global** region broker is w
 | No printers on account | `● OFFLINE — No printers found` | ✅ yes |
 | MQTT blocked but REST reachable | `● ONLINE [cloud-rest]` (coarse status only) | ✅ yes |
 
+### Chamber camera
+
+P1/A1-series printers serve 1280x720 JPEG frames over TLS on **local port 6000**
+(this part is LAN, not cloud — the machine running `pq` must be able to reach the
+printer's IP, and "LAN Mode Liveview" must be enabled on the printer). Setup is
+automatic: the access code comes from the cloud device record, and the printer's LAN
+IP is read from its own MQTT telemetry (`net.info[].ip`), which works even when the
+printer sits on a different subnet/VLAN — SSDP discovery is the fallback. Both are
+cached in config. `pq camera` saves a snapshot; `c` in the TUI toggles a live panel
+(~0.5-1 fps, rendered as half-block pixels — a bigger terminal gives a sharper image).
+The TLS connection to the printer does not verify its self-signed certificate
+(inherent to the device; traffic never leaves your LAN).
+
 ### LAN fallback
 
-A `lan_host` config field is still stored for anyone running LAN-only mode, but the
-current client always uses the cloud. Full LAN MQTT support (Developer Mode) is left as
-a future enhancement.
+A `lan_host` config field stores the printer's LAN IP (used by the camera; auto-
+discovered). Printer *telemetry* still always uses the cloud — full LAN MQTT support
+(Developer Mode) is left as a future enhancement.
 
 ---
 

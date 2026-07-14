@@ -355,23 +355,26 @@ class BambuCloudClient:
 
     # ---- MQTT: one-shot (sync poll) --------------------------------------
     def _mqtt_oneshot(self) -> Optional[dict[str, Any]]:
-        from bambulab.mqtt import MQTTClient, MQTTError
+        from bambulab.mqtt import MQTTError
         _quiet_mqtt_logger()
 
         got = threading.Event()
-        holder: dict[str, Any] = {}
+        acc: dict[str, Any] = {}
+        lock = threading.Lock()
 
         def on_msg(_dev_id: str, data: Any) -> None:
-            if isinstance(data, dict) and isinstance(data.get("print"), dict):
-                holder["print"] = data["print"]
+            if not (isinstance(data, dict) and isinstance(data.get("print"), dict)):
+                return
+            node = data["print"]
+            with lock:
+                acc.update(node)
+            # During an active print the stream is mostly small deltas; keep
+            # merging until the full pushall dump arrives (recognizable by
+            # its breadth — deltas carry a handful of keys, pushall dozens).
+            if "net" in node or "ams" in node or len(node) > 25:
                 got.set()
 
-        client = MQTTClient(
-            username=self.uid,
-            access_token=self.access_token,
-            device_id=self._dev_id,
-            on_message=on_msg,
-        )
+        client = _make_mqtt_client(self.uid, self.access_token, self._dev_id, on_msg)
         try:
             client.connect(blocking=False)
             deadline = time.monotonic() + _CONNECT_BUDGET
@@ -381,7 +384,8 @@ class BambuCloudClient:
                 raise MQTTError("broker connect timed out")
             client.request_full_status()
             got.wait(timeout=_REPORT_BUDGET)
-            return holder.get("print")
+            with lock:
+                return dict(acc) or None
         finally:
             try:
                 client.disconnect()
@@ -445,19 +449,13 @@ class BambuCloudClient:
                 pass
             self._listener = None
 
-        from bambulab.mqtt import MQTTClient
         _quiet_mqtt_logger()
 
         def on_msg(_dev_id: str, data: Any) -> None:
             if isinstance(data, dict) and isinstance(data.get("print"), dict):
                 self._accumulate(data["print"])
 
-        client = MQTTClient(
-            username=self.uid,
-            access_token=self.access_token,
-            device_id=self._dev_id,
-            on_message=on_msg,
-        )
+        client = _make_mqtt_client(self.uid, self.access_token, self._dev_id, on_msg)
         try:
             client.connect(blocking=False)
         except Exception:
@@ -614,6 +612,44 @@ def _quiet_mqtt_logger() -> None:
     disconnect after a one-shot poll) — errors still surface."""
     import logging
     logging.getLogger("bambulab.mqtt").setLevel(logging.ERROR)
+
+
+def _make_mqtt_client(uid: str, access_token: str, device_id: str, on_msg):
+    """Build the library MQTTClient but with a unique client id.
+
+    The library hardcodes client_id to "bambu-client-{serial}", so any two
+    concurrent PrintQueue processes (dashboard + `pq status`) would fight
+    over one broker session ("Client identifier not valid" / takeover
+    loops). We override connect() to use a per-connection unique id.
+    """
+    import ssl
+    import uuid
+
+    import paho.mqtt.client as mqtt
+    from bambulab.mqtt import MQTTClient
+
+    client = MQTTClient(username=uid, access_token=access_token,
+                        device_id=device_id, on_message=on_msg)
+
+    def connect(blocking: bool = False, _c=client) -> None:
+        _c.client = mqtt.Client(
+            mqtt.CallbackAPIVersion.VERSION2,
+            client_id=f"pq-{uuid.uuid4().hex[:12]}",
+        )
+        _c.client.on_connect = _c._on_connect
+        _c.client.on_disconnect = _c._on_disconnect
+        _c.client.on_message = _c._on_message
+        username = _c.username if _c.username.startswith("u_") else f"u_{_c.username}"
+        _c.client.username_pw_set(username, _c.access_token)
+        _c.client.tls_set(cert_reqs=ssl.CERT_REQUIRED, tls_version=ssl.PROTOCOL_TLS)
+        _c.client.connect(_c.BROKER, _c.PORT, keepalive=60)
+        if blocking:
+            _c.client.loop_forever()
+        else:
+            _c.client.loop_start()
+
+    client.connect = connect  # type: ignore[method-assign]
+    return client
 
 
 def _bambulab_available() -> bool:

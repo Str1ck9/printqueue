@@ -204,6 +204,12 @@ def cmd_config(args, db: Database) -> int:
     if args.device is not None:
         cfg.device_id = args.device.strip() or None
         changed = True
+    if args.lan_host is not None:
+        cfg.lan_host = args.lan_host.strip() or None
+        changed = True
+    if args.access_code is not None:
+        cfg.access_code = args.access_code.strip() or None
+        changed = True
     if args.base is not None:
         cfg.cloud_base = args.base.strip() or BAMBU_CLOUD_BASE
         changed = True
@@ -264,6 +270,27 @@ def cmd_history(args, db: Database) -> int:
     return 0
 
 
+def cmd_camera(args, db: Database) -> int:
+    """Grab a snapshot from the printer's chamber camera."""
+    from .camera import CameraError, resolve_camera_target, snapshot
+
+    cfg = load_config()
+    client = BambuCloudClient.from_config(cfg) if cfg.has_token else None
+    try:
+        if not cfg.lan_host:
+            print("Discovering printer on the LAN (SSDP)…", file=sys.stderr)
+        lan_ip, access_code = resolve_camera_target(cfg, client)
+        print(f"Connecting to camera at {lan_ip}:6000…", file=sys.stderr)
+        frame = snapshot(lan_ip, access_code)
+    except CameraError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    out = Path(args.out).expanduser()
+    out.write_bytes(frame)
+    print(f"📷 Snapshot saved: {out}  ({len(frame) / 1024:.0f} KB, 1280x720)")
+    return 0
+
+
 def cmd_dashboard(args, db: Database) -> int:
     try:
         from .ui import run_dashboard
@@ -273,7 +300,7 @@ def cmd_dashboard(args, db: Database) -> int:
         return 1
     cfg = load_config()
     client = BambuCloudClient.from_config(cfg)
-    run_dashboard(db, client)
+    run_dashboard(db, client, cfg=cfg)
     return 0
 
 
@@ -412,6 +439,9 @@ def build_parser() -> argparse.ArgumentParser:
     pconf.add_argument("--token", default=None, help="Bambu Cloud API access token")
     pconf.add_argument("--device", default=None, help="Device id to target (optional)")
     pconf.add_argument("--base", default=None, help=f"Cloud base URL (default {BAMBU_CLOUD_BASE})")
+    pconf.add_argument("--lan-host", default=None, help="Printer LAN IP (camera)")
+    pconf.add_argument("--access-code", default=None,
+                       help="Printer LAN access code (Settings → WLAN on the printer)")
     pconf.add_argument("--clear", action="store_true", help="Wipe stored config")
     pconf.add_argument("--show", action="store_true", help="Print current config (redacted)")
     pconf.set_defaults(func=cmd_config)
@@ -425,6 +455,12 @@ def build_parser() -> argparse.ArgumentParser:
     phist.add_argument("--limit", type=int, default=20)
     phist.add_argument("--csv", action="store_true", help="Output CSV")
     phist.set_defaults(func=cmd_history)
+
+    # camera
+    pcam = sub.add_parser("camera", help="Save a chamber-camera snapshot (LAN)")
+    pcam.add_argument("-o", "--out", default="snapshot.jpg",
+                      help="Output file (default: snapshot.jpg)")
+    pcam.set_defaults(func=cmd_camera)
 
     # dashboard
     pdash = sub.add_parser("dashboard", help="Launch the TUI dashboard")

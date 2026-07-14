@@ -24,8 +24,10 @@ class Config:
     uid: Optional[str] = None  # Bambu account uid — MQTT username is u_{uid}
     device_id: Optional[str] = None
     cloud_base: str = BAMBU_CLOUD_BASE
-    # Legacy LAN fallback — retained for users still running LAN-only mode.
+    # Printer LAN address + access code — used for the local camera stream
+    # (and future LAN MQTT). Auto-discovered/fetched when possible.
     lan_host: Optional[str] = None
+    access_code: Optional[str] = None
     extra: dict[str, Any] = field(default_factory=dict)
 
     @property
@@ -44,6 +46,8 @@ class Config:
         if d.get("access_token"):
             tok = d["access_token"]
             d["access_token"] = f"{tok[:6]}…{tok[-4:]}" if len(tok) > 12 else "***"
+        if d.get("access_code"):
+            d["access_code"] = "***"
         return d
 
 
@@ -57,7 +61,7 @@ def load_config(path: Optional[Path | str] = None) -> Config:
         return Config()
     if not isinstance(raw, dict):
         return Config()
-    known = {"access_token", "uid", "device_id", "cloud_base", "lan_host"}
+    known = {"access_token", "uid", "device_id", "cloud_base", "lan_host", "access_code"}
     extra = {k: v for k, v in raw.items() if k not in known}
     return Config(
         access_token=raw.get("access_token"),
@@ -65,6 +69,7 @@ def load_config(path: Optional[Path | str] = None) -> Config:
         device_id=raw.get("device_id"),
         cloud_base=raw.get("cloud_base") or BAMBU_CLOUD_BASE,
         lan_host=raw.get("lan_host"),
+        access_code=raw.get("access_code"),
         extra=extra,
     )
 
