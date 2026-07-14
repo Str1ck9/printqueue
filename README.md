@@ -233,6 +233,24 @@ printqueue/
 
 ---
 
+## Acknowledgments
+
+The cloud layer stands on the shoulders of the community that reverse-engineered
+Bambu's API:
+
+- **[coelacant1/Bambu-Lab-Cloud-API](https://github.com/coelacant1/Bambu-Lab-Cloud-API)**
+  (`bambu-lab-cloud-api` on PyPI, AGPL-3.0) — the library this app uses for
+  authentication, device listing, and cloud MQTT telemetry.
+- **[Doridian/OpenBambuAPI](https://github.com/Doridian/OpenBambuAPI)** — the
+  community documentation of the cloud HTTP and MQTT protocols.
+
+This project is not affiliated with or endorsed by Bambu Lab.
+
 ## License
 
-MIT.
+MIT — free to copy, modify, and use (including commercially). If you build on
+this project, please keep the copyright notice (per the license) and a link
+back to this repository. See [LICENSE](LICENSE).
+
+Note: the `bambu-lab-cloud-api` dependency is AGPL-3.0; if you distribute a
+combined/derived work, review that license's terms as well.
