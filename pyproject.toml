@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "printqueue"
+version = "0.1.0"
+description = "3D print queue manager for Bambu Lab P1S"
+readme = "README.md"
+requires-python = ">=3.9"
+authors = [{name = "James"}]
+license = {text = "MIT"}
+dependencies = [
+    "textual>=0.47.0",
+    "httpx>=0.25.0",
+]
+
+[project.scripts]
+printqueue = "printqueue.cli:main"
+pq = "printqueue.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["printqueue*"]
