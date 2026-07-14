@@ -91,7 +91,7 @@ class FilamentPanel(Container):
     def compose(self) -> ComposeResult:
         yield Static("[bold cyan]Filament Inventory[/bold cyan]", classes="panel-title")
         table = DataTable(id="filament-table", cursor_type="row", zebra_stripes=True)
-        table.add_columns("ID", "Type", "Color", "Brand", "Remaining")
+        table.add_columns("ID", "Type", "Color", "Brand", "Tray", "Remaining")
         yield table
 
 
@@ -154,6 +154,7 @@ class PrintQueueApp(App):
         Binding("s", "start_selected", "Start Job"),
         Binding("d", "done_selected", "Mark Done"),
         Binding("x", "delete_selected", "Delete Job"),
+        Binding("a", "sync_ams", "Sync AMS"),
     ]
 
     TITLE = "PrintQueue — Bambu P1S"
@@ -227,6 +228,7 @@ class PrintQueueApp(App):
                 row["type"],
                 row["color"],
                 row["brand"],
+                str(row["ams_tray"]) if row["ams_tray"] is not None else "—",
                 remaining,
                 key=f"f{row['id']}",
             )
@@ -301,6 +303,19 @@ class PrintQueueApp(App):
         # first press (or different job / expired window): arm confirmation
         self._pending_delete = (job_id, time.monotonic())
         self.notify(f"Press x again to delete job {job_id}", severity="warning")
+
+    def action_sync_ams(self) -> None:
+        """Reconcile filament inventory with the AMS trays from the last poll."""
+        panel = self.query_one(PrinterPanel)
+        s = panel.status
+        if s is None or not s.online or not s.ams_filaments:
+            self.notify("No AMS data yet (printer offline or still polling)",
+                        severity="warning")
+            return
+        results = self.db.sync_ams_trays(s.ams_filaments)
+        self.refresh_tables()
+        added = sum(1 for r in results if r["action"] == "added")
+        self.notify(f"AMS synced: {len(results)} tray(s), {added} new spool(s)")
 
 
 def run_dashboard(db: Database, client: BambuCloudClient) -> None:

@@ -119,15 +119,52 @@ def cmd_inventory(args, db: Database) -> int:
             return 1
         print(f"− Used {args.grams:.0f}g from filament #{args.filament_id}")
         return 0
+    if args.sub == "set":
+        try:
+            db.set_filament_remaining(args.filament_id, args.grams)
+        except ValueError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+        print(f"= Filament #{args.filament_id} set to {args.grams:.0f}g remaining")
+        return 0
+    if args.sub == "sync":
+        return _inventory_sync(db)
     # default: list
     rows = db.list_filament()
     if not rows:
-        print("(no filament — run: pq inventory add --type PLA --color black --grams 1000)")
+        print("(no filament — run: pq inventory sync  (pull from AMS)"
+              "  or: pq inventory add --type PLA --color black --grams 1000)")
         return 0
-    print(f"{'ID':>4}  {'TYPE':<6}  {'COLOR':<10}  {'BRAND':<10}  REMAINING")
-    print("-" * 60)
+    print(f"{'ID':>4}  {'TYPE':<6}  {'COLOR':<10}  {'BRAND':<12}  {'TRAY':<4}  REMAINING")
+    print("-" * 66)
     for r in rows:
-        print(f"{r['id']:>4}  {r['type']:<6}  {r['color']:<10}  {r['brand']:<10}  {_fmt_grams(r)}")
+        tray = str(r["ams_tray"]) if r["ams_tray"] is not None else "—"
+        print(f"{r['id']:>4}  {r['type']:<6}  {r['color']:<10}  {r['brand']:<12}  "
+              f"{tray:<4}  {_fmt_grams(r)}")
+    return 0
+
+
+def _inventory_sync(db: Database) -> int:
+    """Pull loaded AMS trays from the printer and reconcile inventory."""
+    cfg = load_config()
+    client = BambuCloudClient.from_config(cfg)
+    if not client.configured:
+        print("error: no Bambu Cloud token configured — run: pq login", file=sys.stderr)
+        return 1
+    print("Polling printer for AMS state…", file=sys.stderr)
+    s = client.poll()
+    if not s.online or s.source != "cloud-mqtt":
+        print(f"error: no live telemetry ({s.error or 'printer offline?'})", file=sys.stderr)
+        return 1
+    if not s.ams_filaments:
+        print("error: printer reported no AMS trays", file=sys.stderr)
+        return 1
+    results = db.sync_ams_trays(s.ams_filaments)
+    for r in results:
+        icon = {"added": "＋", "updated": "↻", "matched": "≈"}.get(r["action"], "·")
+        print(f"  {icon} tray {r['tray']}: {r['type']} {r['color']:<10} "
+              f"→ spool #{r['filament_id']}  ({r['grams']:.0f}g remaining, {r['action']})")
+    print(f"✓ Synced {len(results)} AMS tray(s). Shelf spools untouched.")
     return 0
 
 
@@ -355,6 +392,16 @@ def build_parser() -> argparse.ArgumentParser:
 
     inv_list = inv_sub.add_parser("list", help="List filament (default)")
     inv_list.set_defaults(func=cmd_inventory, sub=None)
+
+    inv_sync = inv_sub.add_parser(
+        "sync", help="Pull loaded spools (type/color/remaining %%) from the AMS"
+    )
+    inv_sync.set_defaults(func=cmd_inventory, sub="sync")
+
+    inv_set = inv_sub.add_parser("set", help="Set a spool's remaining grams (absolute)")
+    inv_set.add_argument("filament_id", type=int)
+    inv_set.add_argument("grams", type=float)
+    inv_set.set_defaults(func=cmd_inventory, sub="set")
 
     # status
     pstatus = sub.add_parser("status", help="Poll printer status once (Bambu Cloud API)")

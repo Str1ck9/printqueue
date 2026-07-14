@@ -78,9 +78,11 @@ When the database file is created for the first time, James's default filament s
 | `pq done <job_id> [--failed] [--grams N] [--minutes N]` | Complete (or fail) a job — deducts filament |
 | `pq remove <job_id>` | Delete a job |
 | `pq priority <job_id> <high\|medium\|low>` | Change priority |
-| `pq inventory` | List spools |
+| `pq inventory` | List spools (with AMS tray assignments) |
+| `pq inventory sync` | Pull loaded spools from the AMS (type/color/tray, plus fill %% on RFID spools) |
 | `pq inventory add --type PLA --color black --brand Bambu --grams 1000` | Add a spool |
 | `pq inventory use <filament_id> <grams>` | Manually deduct grams |
+| `pq inventory set <filament_id> <grams>` | Set remaining grams (absolute — e.g. after weighing) |
 | `pq inventory remove <filament_id>` | Remove a spool |
 | `pq status` | One-shot printer poll (Bambu Cloud) |
 | `pq history [--limit N] [--csv]` | Recent prints (CSV export supported) |
@@ -111,7 +113,17 @@ Global: `--db PATH` to override the SQLite location.
 └──────────────────────┴──────────────────────────────────┘
 ```
 
-Keys: `q` quit · `r` refresh · `s` start job · `d` mark done · `x` twice to delete (confirmation) · arrows to navigate.
+Keys: `q` quit · `r` refresh · `s` start job · `d` mark done · `x` twice to delete (confirmation) · `a` sync AMS → inventory · arrows to navigate.
+
+### AMS inventory sync
+
+`pq inventory sync` (or `a` in the TUI) reconciles inventory with what's physically
+loaded: it matches loaded trays to existing spools by type + color (creating spools it
+has never seen, including duplicates like two black PLAs), records each spool's tray,
+and clears tray assignments on unloaded shelf spools without touching their grams.
+**Fill percentage is only reported for Bambu RFID-tagged spools** (`remain: -1` +
+zeroed `tag_uid` = third-party spool); untagged spools are assumed full on first sync
+and tracked downward by job deductions — correct anytime with `pq inventory set`.
 
 The printer panel refreshes every 5 seconds from a persistent MQTT subscription (updates
 arrive pushed, not polled). Queue/inventory/history tables also auto-refresh every 15s.

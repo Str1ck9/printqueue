@@ -33,14 +33,51 @@ def utc_to_local_str(ts: Optional[str], fmt: str = "%Y-%m-%d %H:%M") -> str:
 class JobError(ValueError):
     """Raised for invalid job state transitions (e.g. double completion)."""
 
+
+# Small named palette for turning AMS #RRGGBB values into human names.
+_NAMED_COLORS = {
+    "black": (0, 0, 0),
+    "white": (255, 255, 255),
+    "gray": (128, 128, 128),
+    "red": (220, 40, 40),
+    "orange": (255, 140, 30),
+    "yellow": (245, 220, 40),
+    "green": (40, 180, 80),
+    "teal": (0, 150, 150),
+    "blue": (40, 80, 200),
+    "purple": (140, 60, 200),
+    "pink": (240, 130, 170),
+    "brown": (140, 90, 50),
+    "beige": (230, 210, 170),
+}
+
+
+def color_name(hex_color: Optional[str]) -> str:
+    """Nearest human name for a '#RRGGBB' value ('unknown' if unparseable)."""
+    if not hex_color:
+        return "unknown"
+    h = hex_color.lstrip("#")
+    if len(h) < 6:
+        return hex_color
+    try:
+        r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+    except ValueError:
+        return hex_color
+    return min(
+        _NAMED_COLORS,
+        key=lambda n: sum((a - c) ** 2 for a, c in zip(_NAMED_COLORS[n], (r, g, b))),
+    )
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS filament (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     type TEXT NOT NULL,           -- PLA, PETG, ABS, etc.
     color TEXT NOT NULL,
+    color_hex TEXT,               -- #RRGGBB as reported by the AMS (if synced)
     brand TEXT NOT NULL DEFAULT 'Unknown',
     grams_remaining REAL NOT NULL DEFAULT 0,
     grams_initial REAL NOT NULL DEFAULT 1000,
+    ams_tray INTEGER,             -- AMS tray currently holding this spool
     notes TEXT,
     added_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
@@ -117,6 +154,15 @@ class Database:
     def _init_schema(self) -> None:
         with self.connect() as conn:
             conn.executescript(SCHEMA)
+            # Migrations for DBs created before these columns existed.
+            for ddl in (
+                "ALTER TABLE filament ADD COLUMN color_hex TEXT",
+                "ALTER TABLE filament ADD COLUMN ams_tray INTEGER",
+            ):
+                try:
+                    conn.execute(ddl)
+                except sqlite3.OperationalError:
+                    pass  # column already present
 
     # ---- Filament ---------------------------------------------------------
     def add_filament(
@@ -158,9 +204,121 @@ class Database:
                 (grams_used, filament_id),
             )
 
+    def set_filament_remaining(self, filament_id: int, grams: float) -> None:
+        """Set a spool's remaining grams to an absolute value (weighed it, etc.)."""
+        if grams < 0:
+            raise ValueError("grams must be >= 0")
+        with self.connect() as conn:
+            conn.execute(
+                "UPDATE filament SET grams_remaining = ? WHERE id = ?",
+                (grams, filament_id),
+            )
+
     def delete_filament(self, filament_id: int) -> None:
         with self.connect() as conn:
             conn.execute("DELETE FROM filament WHERE id = ?", (filament_id,))
+
+    def sync_ams_trays(
+        self,
+        trays: list[dict[str, Any]],
+        default_grams: float = 1000.0,
+    ) -> list[dict[str, Any]]:
+        """Reconcile inventory with what the AMS reports as loaded.
+
+        `trays` is PrinterStatus.ams_filaments: dicts with id, type,
+        color ('#RRGGBB'), remaining (percent 0-100, or None/-1 = unknown).
+
+        Matching per tray, in order:
+          1. the spool previously assigned to this tray, if type+color still match
+             (same physical spool, just refresh grams);
+          2. any unclaimed spool with matching type and color (hex, or the
+             hex's nearest color name for manually-added spools);
+          3. otherwise insert a new spool (grams_initial=default_grams).
+
+        Spools the AMS doesn't see (shelf spools) keep their grams and simply
+        lose any stale tray assignment. Known remaining %% sets
+        grams_remaining = %% x grams_initial; unknown leaves grams untouched.
+
+        Returns a list of {tray, action, filament_id, type, color, grams}
+        where action is one of updated / matched / added.
+        """
+        results: list[dict[str, Any]] = []
+        with self.connect() as conn:
+            rows = conn.execute("SELECT * FROM filament").fetchall()
+            prev_by_tray = {
+                r["ams_tray"]: r for r in rows if r["ams_tray"] is not None
+            }
+            conn.execute("UPDATE filament SET ams_tray = NULL")
+            claimed: set[int] = set()
+
+            for t in trays:
+                ttype = str(t.get("type") or "").upper()
+                if not ttype:
+                    continue  # empty slot
+                try:
+                    tray_id = int(t.get("id"))
+                except (TypeError, ValueError):
+                    tray_id = None
+                hexcol = str(t.get("color") or "").upper() or None
+                cname = color_name(hexcol)
+                remain = t.get("remaining")
+                try:
+                    remain = float(remain)
+                except (TypeError, ValueError):
+                    remain = None
+                if remain is not None and remain < 0:
+                    remain = None  # -1 = unknown (non-RFID spool)
+
+                def _matches(r) -> bool:
+                    if r["id"] in claimed or r["type"] != ttype:
+                        return False
+                    if hexcol and (r["color_hex"] or "").upper() == hexcol:
+                        return True
+                    return str(r["color"]).lower() == cname
+
+                row = None
+                action = "matched"
+                prev = prev_by_tray.get(tray_id)
+                if prev is not None and _matches(prev):
+                    row, action = prev, "updated"
+                else:
+                    row = next((r for r in rows if _matches(r)), None)
+
+                if row is not None:
+                    claimed.add(row["id"])
+                    grams = row["grams_remaining"]
+                    if remain is not None:
+                        grams = round(remain / 100.0 * row["grams_initial"], 1)
+                    conn.execute(
+                        "UPDATE filament SET ams_tray = ?, grams_remaining = ?, "
+                        "color_hex = COALESCE(color_hex, ?) WHERE id = ?",
+                        (tray_id, grams, hexcol, row["id"]),
+                    )
+                    results.append({
+                        "tray": tray_id, "action": action, "filament_id": row["id"],
+                        "type": ttype, "color": row["color"], "grams": grams,
+                    })
+                else:
+                    grams = (
+                        round(remain / 100.0 * default_grams, 1)
+                        if remain is not None else default_grams
+                    )
+                    cur = conn.execute(
+                        """INSERT INTO filament
+                           (type, color, color_hex, brand, grams_remaining,
+                            grams_initial, ams_tray, notes)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (ttype, cname, hexcol, "Bambu (AMS)", grams,
+                         default_grams, tray_id,
+                         "Auto-added by AMS sync"
+                         + ("" if remain is not None else " (remaining unknown)")),
+                    )
+                    claimed.add(cur.lastrowid)
+                    results.append({
+                        "tray": tray_id, "action": "added", "filament_id": cur.lastrowid,
+                        "type": ttype, "color": cname, "grams": grams,
+                    })
+        return results
 
     # ---- Jobs -------------------------------------------------------------
     def add_job(

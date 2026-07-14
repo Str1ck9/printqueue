@@ -200,3 +200,91 @@ def test_seed_defaults_idempotent(db):
     # force adds again
     assert db.seed_defaults(force=True) is True
     assert len(db.list_filament()) == 6
+
+
+# ---- AMS sync ---------------------------------------------------------------
+def _trays(*specs):
+    """specs: (id, type, color_hex, remaining_pct)"""
+    return [
+        {"id": i, "type": t, "color": c, "remaining": r}
+        for (i, t, c, r) in specs
+    ]
+
+
+def test_sync_creates_spools_including_duplicate_colors(db):
+    results = db.sync_ams_trays(_trays(
+        (0, "PLA", "#000000", 80),
+        (1, "PLA", "#FFFFFF", 100),
+        (2, "PLA", "#000000", 40),   # second black spool
+        (3, "PLA", "#F72323", -1),   # unknown remaining
+    ))
+    assert [r["action"] for r in results] == ["added"] * 4
+    rows = db.list_filament()
+    assert len(rows) == 4
+    by_tray = {r["ams_tray"]: r for r in rows}
+    assert by_tray[0]["grams_remaining"] == 800.0
+    assert by_tray[1]["color"] == "white"
+    assert by_tray[2]["grams_remaining"] == 400.0  # distinct spool from tray 0
+    assert by_tray[3]["color"] == "red"
+    assert by_tray[3]["grams_remaining"] == 1000.0  # unknown -> assume initial
+
+
+def test_resync_updates_grams_without_duplicating(db):
+    db.sync_ams_trays(_trays((0, "PLA", "#000000", 80)))
+    results = db.sync_ams_trays(_trays((0, "PLA", "#000000", 70)))
+    assert results[0]["action"] == "updated"
+    rows = db.list_filament()
+    assert len(rows) == 1
+    assert rows[0]["grams_remaining"] == 700.0
+
+
+def test_sync_matches_manual_spool_by_color_name(db):
+    fid = db.add_filament("PLA", "black", "Bambu", 1000)
+    results = db.sync_ams_trays(_trays((2, "PLA", "#000000", 50)))
+    assert results[0]["action"] == "matched"
+    assert results[0]["filament_id"] == fid
+    row = db.get_filament(fid)
+    assert row["ams_tray"] == 2
+    assert row["grams_remaining"] == 500.0
+    assert len(db.list_filament()) == 1
+
+
+def test_sync_unloaded_spool_keeps_grams_loses_tray(db):
+    db.sync_ams_trays(_trays((0, "PLA", "#000000", 80), (1, "PETG", "#FFFFFF", 90)))
+    # black spool pulled out of the AMS; only PETG remains loaded
+    db.sync_ams_trays(_trays((1, "PETG", "#FFFFFF", 85)))
+    rows = {r["type"]: r for r in db.list_filament()}
+    assert rows["PLA"]["ams_tray"] is None
+    assert rows["PLA"]["grams_remaining"] == 800.0  # untouched
+    assert rows["PETG"]["ams_tray"] == 1
+    assert rows["PETG"]["grams_remaining"] == 850.0
+
+
+def test_sync_unknown_remaining_keeps_existing_grams(db):
+    db.sync_ams_trays(_trays((0, "PLA", "#000000", 80)))
+    db.sync_ams_trays(_trays((0, "PLA", "#000000", None)))
+    assert db.list_filament()[0]["grams_remaining"] == 800.0
+
+
+def test_sync_skips_empty_slots(db):
+    results = db.sync_ams_trays(_trays((0, "", None, None), (1, "PLA", "#0A2CA5", 60)))
+    assert len(results) == 1
+    assert results[0]["color"] == "blue"
+
+
+def test_color_name():
+    from printqueue.db import color_name
+    assert color_name("#000000") == "black"
+    assert color_name("#FFFFFF") == "white"
+    assert color_name("#F72323") == "red"
+    assert color_name("#0A2CA5") == "blue"
+    assert color_name(None) == "unknown"
+    assert color_name("garbage") == "garbage"
+
+
+def test_set_filament_remaining(db):
+    fid = db.add_filament("PLA", "black", "Bambu", 1000)
+    db.set_filament_remaining(fid, 640)
+    assert db.get_filament(fid)["grams_remaining"] == 640.0
+    with pytest.raises(ValueError):
+        db.set_filament_remaining(fid, -5)
