@@ -9,6 +9,8 @@ A terminal-based 3D print queue manager for the **Bambu Lab P1S** (Cloud mode).
 - 🎛️ Textual TUI dashboard **and** full CLI
 - 🌐 Works fully offline — if the cloud is unreachable or not configured, queue management still runs
 
+![PrintQueue dashboard](screenshots/dashboard.png)
+
 ---
 
 ## Install
