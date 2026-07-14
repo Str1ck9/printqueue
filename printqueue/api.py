@@ -356,6 +356,7 @@ class BambuCloudClient:
     # ---- MQTT: one-shot (sync poll) --------------------------------------
     def _mqtt_oneshot(self) -> Optional[dict[str, Any]]:
         from bambulab.mqtt import MQTTClient, MQTTError
+        _quiet_mqtt_logger()
 
         got = threading.Event()
         holder: dict[str, Any] = {}
@@ -445,6 +446,7 @@ class BambuCloudClient:
             self._listener = None
 
         from bambulab.mqtt import MQTTClient
+        _quiet_mqtt_logger()
 
         def on_msg(_dev_id: str, data: Any) -> None:
             if isinstance(data, dict) and isinstance(data.get("print"), dict):
@@ -605,6 +607,13 @@ class BambuCloudClient:
                     "remaining": remain,
                 })
         return out
+
+
+def _quiet_mqtt_logger() -> None:
+    """Silence the library's chatty warnings (e.g. on our own intentional
+    disconnect after a one-shot poll) — errors still surface."""
+    import logging
+    logging.getLogger("bambulab.mqtt").setLevel(logging.ERROR)
 
 
 def _bambulab_available() -> bool:
