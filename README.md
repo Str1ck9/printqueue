@@ -208,9 +208,11 @@ automatic: the access code comes from the cloud device record, and the printer's
 IP is read from its own MQTT telemetry (`net.info[].ip`), which works even when the
 printer sits on a different subnet/VLAN — SSDP discovery is the fallback. Both are
 cached in config. `pq camera` saves a snapshot; `c` in the TUI toggles a live panel
-(~0.5-1 fps, rendered as half-block pixels — a bigger terminal gives a sharper image).
-The TLS connection to the printer does not verify its self-signed certificate
-(inherent to the device; traffic never leaves your LAN).
+(~0.5-1 fps). Frames render as **true bitmaps** on terminals with Sixel or the Kitty
+graphics protocol (iTerm2, kitty, WezTerm) and fall back to Unicode half-blocks
+elsewhere — the renderer is auto-detected at startup. The TLS connection to the
+printer does not verify its self-signed certificate (inherent to the device;
+traffic never leaves your LAN).
 
 ### LAN fallback
 

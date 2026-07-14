@@ -13,8 +13,7 @@ license = {text = "MIT"}
 dependencies = [
     "textual>=0.47.0",
     "bambu-lab-cloud-api==1.0.5",
-    "rich-pixels>=3.0",
-    "pillow>=10.0",
+    "textual-image>=0.13",
 ]
 
 [project.optional-dependencies]

@@ -18,6 +18,23 @@ from textual.widgets import (
 from .api import BambuCloudClient, PrinterStatus
 from .db import Database, JobError, utc_to_local_str
 
+# Camera rendering. `textual-image` probes the terminal (once, at import —
+# which is why this happens before the Textual app starts) and picks the best
+# available renderer: Sixel or the Kitty graphics protocol for true bitmap
+# frames (e.g. iTerm2, kitty, WezTerm), falling back to Unicode half-blocks on
+# terminals without graphics support. `_CAM_GRAPHICS` is True only for the
+# real-pixel protocols, so we can size frames to the panel's pixel dimensions.
+try:
+    from textual_image.widget import Image as CameraImageWidget
+    from textual_image.renderable import Image as _CamRenderable
+
+    _CAM_PROTOCOL = _CamRenderable.__module__.rsplit(".", 1)[-1]
+    _CAM_GRAPHICS = _CAM_PROTOCOL in ("sixel", "tgp")
+except Exception:  # pragma: no cover - textual-image is a hard dep, but be safe
+    CameraImageWidget = None
+    _CAM_PROTOCOL = None
+    _CAM_GRAPHICS = False
+
 
 PRIORITY_LABEL = {"high": "🔴 HIGH", "medium": "🟡 MED", "low": "🟢 LOW"}
 STATUS_LABEL = {
@@ -105,11 +122,38 @@ class HistoryPanel(Container):
         yield table
 
 
-class CameraPanel(Static):
-    """Live chamber-camera view (rendered as half-block pixels)."""
+class CameraPanel(Container):
+    """Live chamber-camera view.
 
-    def on_mount(self) -> None:
-        self.update("[bold cyan]Camera[/bold cyan]\n\n  connecting…")
+    Holds a status line (for connecting/error messages) and — when a terminal
+    graphics protocol is available — an image widget for real bitmap frames.
+    On terminals without graphics support the frames are drawn into the status
+    Static as Unicode half-blocks via the same image widget's fallback.
+    """
+
+    def compose(self) -> ComposeResult:
+        yield Static("[bold cyan]Camera[/bold cyan]\n\n  connecting…",
+                     id="cam-status")
+        if CameraImageWidget is not None:
+            img = CameraImageWidget(id="cam-image")
+            img.display = False
+            yield img
+
+    def show_status(self, markup: str) -> None:
+        self.query_one("#cam-status", Static).update(markup)
+        self.query_one("#cam-status", Static).display = True
+        imgs = self.query("#cam-image")
+        if imgs:
+            imgs.first().display = False
+
+    def show_frame(self, image_source) -> None:
+        imgs = self.query("#cam-image")
+        if not imgs:
+            return
+        img = imgs.first(CameraImageWidget)
+        img.image = image_source
+        img.display = True
+        self.query_one("#cam-status", Static).display = False
 
 
 class PrintQueueApp(App):
@@ -138,6 +182,10 @@ class PrintQueueApp(App):
         border: round blue;
         padding: 0 1;
         display: none;
+    }
+    #cam-image {
+        width: 100%;
+        height: 100%;
     }
     QueuePanel {
         width: 60%;
@@ -344,7 +392,7 @@ class PrintQueueApp(App):
             return
         cam.display = True
         printer.styles.width = "24%"
-        cam.update("[bold cyan]Camera[/bold cyan]\n\n  connecting…")
+        cam.show_status("[bold cyan]Camera[/bold cyan]\n\n  connecting…")
         self.run_worker(self._start_camera, thread=True, exclusive=True,
                         group="camera")
 
@@ -365,7 +413,7 @@ class PrintQueueApp(App):
 
     def _camera_failed(self, msg: str) -> None:
         cam = self.query_one(CameraPanel)
-        cam.update(f"[bold cyan]Camera[/bold cyan]\n\n  [red]✗[/red] {msg}")
+        cam.show_status(f"[bold cyan]Camera[/bold cyan]\n\n  [red]✗[/red] {msg}")
         self.notify("Camera unavailable", severity="warning")
 
     def _update_camera(self) -> None:
@@ -377,32 +425,20 @@ class PrintQueueApp(App):
         frame = stream.frame
         if frame is None:
             if stream.error:
-                cam.update(f"[bold cyan]Camera[/bold cyan]\n\n"
-                           f"  [red]✗[/red] {stream.error}")
+                cam.show_status(f"[bold cyan]Camera[/bold cyan]\n\n"
+                                f"  [red]✗[/red] {stream.error}")
             return
         if stream._frame_ts == self._camera_frame_ts:
             return  # nothing new
-        try:
-            import io
-            from PIL import Image
-            from rich_pixels import Pixels
-        except ImportError as exc:
-            cam.update(f"[bold cyan]Camera[/bold cyan]\n\n"
-                       f"  [red]✗[/red] render deps missing: {exc}\n"
-                       f"  pip install rich-pixels pillow")
+        if CameraImageWidget is None:
+            cam.show_status("[bold cyan]Camera[/bold cyan]\n\n"
+                            "  [red]✗[/red] textual-image not installed")
             return
-        size = cam.content_size
-        if size.width < 4 or size.height < 3:
-            return
-        img = Image.open(io.BytesIO(frame))
-        # 1 cell = 1px wide x 2px tall (half-block rendering); leave a title row
-        max_w, max_h = size.width, (size.height - 1) * 2
-        scale = min(max_w / img.width, max_h / img.height)
-        img = img.resize((max(1, int(img.width * scale)),
-                          max(1, int(img.height * scale))),
-                         Image.Resampling.LANCZOS)
+        import io
         self._camera_frame_ts = stream._frame_ts
-        cam.update(Pixels.from_image(img))
+        # Hand the raw JPEG to the image widget; it scales to the panel and
+        # renders via the best protocol (Sixel/Kitty → crisp; else half-blocks).
+        cam.show_frame(io.BytesIO(frame))
 
     def action_sync_ams(self) -> None:
         """Reconcile filament inventory with the AMS trays from the last poll."""

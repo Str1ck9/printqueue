@@ -3,6 +3,7 @@ textual>=0.47.0
 # pulls paho-mqtt, requests, and — for features we don't use — flask +
 # opencv-python).
 bambu-lab-cloud-api==1.0.5
-# Camera rendering in the TUI (half-block pixel images)
-rich-pixels>=3.0
-pillow>=10.0
+# Camera rendering in the TUI. Uses Sixel / Kitty graphics for crisp frames
+# on capable terminals (iTerm2, kitty, WezTerm), half-block Unicode elsewhere.
+# Pulls in pillow.
+textual-image>=0.13
