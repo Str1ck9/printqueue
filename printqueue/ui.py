@@ -1,7 +1,7 @@
 """Textual TUI dashboard for PrintQueue."""
 from __future__ import annotations
 
-from datetime import datetime
+import time
 from typing import Optional
 
 from textual.app import App, ComposeResult
@@ -16,7 +16,7 @@ from textual.widgets import (
 )
 
 from .api import BambuCloudClient, PrinterStatus
-from .db import Database
+from .db import Database, JobError, utc_to_local_str
 
 
 PRIORITY_LABEL = {"high": "🔴 HIGH", "medium": "🟡 MED", "low": "🟢 LOW"}
@@ -163,6 +163,8 @@ class PrintQueueApp(App):
         self.db = db
         self.client = client
         self.poll_seconds = poll_seconds
+        # (job_id, monotonic timestamp) of a pending delete confirmation
+        self._pending_delete: Optional[tuple[int, float]] = None
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -178,6 +180,8 @@ class PrintQueueApp(App):
         self.refresh_tables()
         # kick off periodic printer poll
         self.set_interval(self.poll_seconds, self.poll_printer)
+        # periodically refresh tables so jobs added elsewhere appear
+        self.set_interval(15.0, self.refresh_tables)
         # initial poll right away
         await self.poll_printer()
 
@@ -197,6 +201,7 @@ class PrintQueueApp(App):
 
     def _refresh_queue(self) -> None:
         table = self.query_one("#queue-table", DataTable)
+        cursor = table.cursor_coordinate
         table.clear()
         for row in self.db.list_jobs():
             table.add_row(
@@ -208,6 +213,9 @@ class PrintQueueApp(App):
                 f"{row['estimated_minutes']}m" if row["estimated_minutes"] else "—",
                 key=str(row["id"]),
             )
+        # preserve the cursor position across the clear/rebuild
+        if cursor is not None and 0 <= cursor.row < table.row_count:
+            table.cursor_coordinate = cursor
 
     def _refresh_filament(self) -> None:
         table = self.query_one("#filament-table", DataTable)
@@ -227,11 +235,7 @@ class PrintQueueApp(App):
         table = self.query_one("#history-table", DataTable)
         table.clear()
         for row in self.db.list_history(limit=20):
-            when = row["finished_at"]
-            try:
-                when = datetime.fromisoformat(when).strftime("%m-%d %H:%M")
-            except (ValueError, TypeError):
-                pass
+            when = utc_to_local_str(row["finished_at"], "%m-%d %H:%M")
             table.add_row(
                 str(when),
                 row["job_name"],
@@ -270,21 +274,11 @@ class PrintQueueApp(App):
         if job_id is None:
             self.notify("No job selected", severity="warning")
             return
-        job = self.db.get_job(job_id)
-        if job is None:
-            self.notify(f"Job {job_id} not found", severity="error")
+        try:
+            self.db.finish_job(job_id)
+        except JobError as e:
+            self.notify(str(e), severity="warning")
             return
-        self.db.set_job_status(job_id, "done")
-        self.db.add_history(
-            job_id=job_id,
-            job_name=job["name"],
-            filament_type=job["filament_type"],
-            grams_used=job["estimated_grams"] or 0,
-            minutes_taken=job["estimated_minutes"] or 0,
-            status="done",
-        )
-        if job["filament_id"] and job["estimated_grams"]:
-            self.db.update_filament_grams(job["filament_id"], job["estimated_grams"])
         self.refresh_tables()
         self.notify(f"Job {job_id} completed")
 
@@ -293,9 +287,20 @@ class PrintQueueApp(App):
         if job_id is None:
             self.notify("No job selected", severity="warning")
             return
-        self.db.delete_job(job_id)
-        self.refresh_tables()
-        self.notify(f"Job {job_id} deleted")
+        pending = self._pending_delete
+        if (
+            pending is not None
+            and pending[0] == job_id
+            and (time.monotonic() - pending[1]) <= 3.0
+        ):
+            self._pending_delete = None
+            self.db.delete_job(job_id)
+            self.refresh_tables()
+            self.notify(f"Job {job_id} deleted")
+            return
+        # first press (or different job / expired window): arm confirmation
+        self._pending_delete = (job_id, time.monotonic())
+        self.notify(f"Press x again to delete job {job_id}", severity="warning")
 
 
 def run_dashboard(db: Database, client: BambuCloudClient) -> None:

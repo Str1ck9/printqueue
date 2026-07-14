@@ -1,42 +1,74 @@
-"""Bambu Cloud authentication — login + 2FA/verification code flow.
+"""Bambu Cloud authentication — real login + email-verification flow.
 
-Bambu Lab does NOT expose a static API token on their account page.
-Authentication requires an interactive login flow:
+Bambu Lab does NOT expose a static API token on their account page. A token
+is obtained by logging in through their (unofficial, reverse-engineered)
+cloud auth flow:
 
-1. POST email + password to the auth endpoint → get a verification challenge
-2. User receives a verification code via email (or 2FA TOTP)
-3. POST the code back → receive a Cloud Access Token (~3 months valid)
+1. POST email + password to ``/v1/user-service/user/login``.
+2. Depending on account security, Bambu responds with:
+   - ``loginType == "verifyCode"`` → it emails a code; we POST it back
+     (after first triggering ``/sendemail/code``) to complete login.
+   - ``loginType == "tfa"`` → a TOTP/MFA code is required.
+   - ``success == true`` with an ``accessToken`` → no second factor.
+3. On success we receive a Cloud Access Token (valid for months).
 
-This module provides both an interactive CLI login flow and the ability
-to accept a token directly if the user already has one (extracted via
-browser dev tools, a third-party tool, etc.).
+All of that is handled by ``bambulab.auth.BambuAuthenticator`` — this module
+just drives the interactive UX (prompts on stderr) and adapts the result to
+PrintQueue's config. The token is also persisted by the library to
+``~/.printqueue/bambu_token`` as a side effect.
 
-References:
-- https://github.com/coelacant1/bambu-lab-cloud-api (Python lib with full login+MQTT)
-- Community-reversed Bambu Cloud auth flow (documented via traffic analysis)
+If the interactive flow can't complete, the raised ``AuthError`` includes
+the manual browser-devtools token-extraction fallback.
+
+Reference: https://github.com/coelacant1/bambu-lab-cloud-api
 """
 from __future__ import annotations
 
 import getpass
 import sys
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional
 
-import httpx
+AUTH_TIMEOUT = 30.0
+TOKEN_FILE = Path.home() / ".printqueue" / "bambu_token"
 
-AUTH_BASE = "https://api.bambulab.com"
-AUTH_TIMEOUT = 10.0
+_MANUAL_FALLBACK = (
+    "\nIf login keeps failing, extract the token manually:\n"
+    "  1. Log into https://bambulab.com in your browser\n"
+    "  2. Open DevTools → Network tab\n"
+    "  3. Find a request to api.bambulab.com → copy the Authorization "
+    "header (the part after 'Bearer ')\n"
+    "  4. Run: pq config --token <TOKEN>"
+)
 
 
 class AuthError(Exception):
     """Raised when Bambu Cloud auth fails for any reason."""
 
 
-def _headers() -> dict[str, str]:
-    return {
-        "Accept": "application/json",
-        "Content-Type": "application/json",
-        "User-Agent": "PrintQueue/0.1",
-    }
+@dataclass
+class LoginResult:
+    """Result of an interactive login."""
+    token: str
+    uid: Optional[str] = None
+
+
+def _region_key(region: str) -> str:
+    return "china" if str(region).lower() in ("china", "cn") else "global"
+
+
+def _import_bambulab():
+    """Lazy import so a queue-only install (no bambu-lab-cloud-api) still runs."""
+    try:
+        from bambulab.auth import BambuAuthenticator, BambuAuthError
+        from bambulab.client import BambuClient
+    except Exception as exc:  # ImportError or transitive failure
+        raise AuthError(
+            "bambu-lab-cloud-api not installed — run: "
+            "pip install bambu-lab-cloud-api"
+        ) from exc
+    return BambuAuthenticator, BambuAuthError, BambuClient
 
 
 # ---- Interactive login flow -----------------------------------------------
@@ -44,22 +76,19 @@ def _headers() -> dict[str, str]:
 def interactive_login(
     region: str = "global",
     timeout: float = AUTH_TIMEOUT,
-) -> str:
+) -> LoginResult:
     """Run the full interactive Bambu Cloud login flow.
 
-    Steps:
-    1. Prompt for email + password
-    2. Send login request → get verification challenge
-    3. Prompt for verification code (email or TOTP)
-    4. Exchange code for access token
+    Prompts (email/password/verification code) go to stderr; the code is
+    read via ``input()`` and the password via ``getpass``. Delegates the
+    actual protocol to ``BambuAuthenticator``.
 
-    Returns the access token string.
+    Returns a ``LoginResult`` with the access token and (best-effort) uid.
 
-    Raises AuthError on any failure.
+    Raises ``AuthError`` on any failure.
     """
-    base = _base_for_region(region)
+    BambuAuthenticator, BambuAuthError, BambuClient = _import_bambulab()
 
-    # Step 1: credentials
     print("\n🔐 Bambu Lab Cloud Login", file=sys.stderr)
     print("─" * 40, file=sys.stderr)
     email = input("  Email: ").strip()
@@ -69,150 +98,81 @@ def interactive_login(
     if not password:
         raise AuthError("Password is required")
 
-    # Step 2: initiate login
+    def code_callback() -> str:
+        print("  📧 Bambu sent a verification code (check your email / authenticator).",
+              file=sys.stderr)
+        return input("  Enter code: ").strip()
+
+    # The library persists the token to token_file; make sure its dir exists.
+    try:
+        TOKEN_FILE.parent.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
+
+    authenticator = BambuAuthenticator(
+        region=_region_key(region),
+        token_file=str(TOKEN_FILE),
+    )
+    # Respect the requested timeout for the library's HTTP session.
+    try:
+        authenticator.session.request = _with_timeout(  # type: ignore[assignment]
+            authenticator.session.request, timeout
+        )
+    except Exception:
+        pass  # non-fatal — library has its own 30s default
+
     print("\n  Sending login request…", file=sys.stderr)
     try:
-        with httpx.Client(timeout=timeout, headers=_headers()) as client:
-            login_resp = client.post(
-                f"{base}/v1/user-service/user/login",
-                json={"account": email, "password": password},
-            )
-    except httpx.HTTPError as exc:
-        raise AuthError(f"Login request failed: {exc}") from exc
+        token = authenticator.login(email, password, code_callback)
+    except BambuAuthError as exc:
+        raise AuthError(f"Login failed: {exc}{_MANUAL_FALLBACK}") from exc
+    except Exception as exc:
+        raise AuthError(f"Unexpected login error: {exc}{_MANUAL_FALLBACK}") from exc
 
-    data = _parse_json(login_resp)
-    if login_resp.status_code >= 400 or not isinstance(data, dict):
-        msg = data.get("message", "") if isinstance(data, dict) else ""
-        raise AuthError(f"Login rejected (HTTP {login_resp.status_code}): {msg}")
-
-    # Bambu may use different responses depending on account security settings:
-    # - "verifyCode" or "verificationCode" → email code needed
-    # - "tfaKey" or "tfa_key" → TOTP 2FA needed
-    # - "accessToken" present → no 2FA required (rare)
-
-    tok = _extract_token(data)
-    if tok:
-        print("  ✅ Logged in (no 2FA required)", file=sys.stderr)
-        return tok
-
-    # Step 3: verification code
-    code_method = "verification code (check your email)" if "tfa" not in str(data).lower() else "2FA/TOTP code"
-    print(f"  📧 Bambu sent a {code_method}", file=sys.stderr)
-    code = input("  Enter code: ").strip()
-    if not code:
-        raise AuthError("Verification code is required")
-
-    # Step 4: verify
-    print("  Verifying…", file=sys.stderr)
-    verify_payload = _build_verify_payload(data, code)
-    verify_path = _pick_verify_path(data)
-
-    try:
-        with httpx.Client(timeout=timeout, headers=_headers()) as client:
-            verify_resp = client.post(
-                f"{base}{verify_path}",
-                json=verify_payload,
-            )
-    except httpx.HTTPError as exc:
-        raise AuthError(f"Verification request failed: {exc}") from exc
-
-    verify_data = _parse_json(verify_resp)
-    if verify_resp.status_code >= 400 or not isinstance(verify_data, dict):
-        msg = verify_data.get("message", "Unknown error") if isinstance(verify_data, dict) else "Unknown error"
-        raise AuthError(f"Verification failed (HTTP {verify_resp.status_code}): {msg}")
-
-    tok = _extract_token(verify_data)
-    if not tok:
-        # Some versions return a separate token exchange step
-        tok = _extract_token(data)  # fallback to original response
-
-    if not tok:
-        raise AuthError("Could not extract access token from verification response.\n"
-                        "Try extracting the token manually via browser dev tools:\n"
-                        "  1. Log into https://bambulab.com in your browser\n"
-                        "  2. Open DevTools → Network tab\n"
-                        "  3. Look for requests to api.bambulab.com → copy the Authorization header\n"
-                        "  4. Run: pq config --token <TOKEN>")
+    if not token:
+        raise AuthError("Login returned no token." + _MANUAL_FALLBACK)
 
     print("  ✅ Authentication successful!", file=sys.stderr)
-    return tok
 
-
-def _base_for_region(region: str) -> str:
-    region = region.lower()
-    if region in ("china", "cn"):
-        return "https://api.bambulab.cn"
-    return "https://api.bambulab.com"
-
-
-def _parse_json(resp: httpx.Response) -> dict | list | str | None:
+    # Best-effort: fetch uid (MQTT username) so api.py needn't re-resolve it.
+    uid: Optional[str] = None
     try:
-        return resp.json()
-    except Exception:
-        return None
+        client = BambuClient(token)
+        if _region_key(region) == "china":
+            client.BASE_URL = "https://api.bambulab.cn"
+        info = client.get_user_info()
+        if isinstance(info, dict) and info.get("uid") is not None:
+            uid = str(info["uid"])
+    except Exception as exc:
+        print(f"  ⚠ Could not fetch account uid ({exc}); it will be resolved "
+              f"automatically on first status poll.", file=sys.stderr)
+
+    return LoginResult(token=token, uid=uid)
 
 
-def _extract_token(data: dict) -> Optional[str]:
-    """Probe common token field names across Bambu Cloud API versions."""
-    if not isinstance(data, dict):
-        return None
-    for key in ("accessToken", "access_token", "token", "auth_token", "bearer_token"):
-        v = data.get(key)
-        if isinstance(v, str) and v.strip():
-            return v.strip()
-    # Nested: some versions wrap it
-    for sub in ("data", "result", "content"):
-        inner = data.get(sub)
-        if isinstance(inner, dict):
-            tok = _extract_token(inner)
-            if tok:
-                return tok
-    return None
+def _with_timeout(request_fn, timeout: float):
+    """Wrap requests.Session.request to inject a default timeout."""
+    def wrapped(*args, **kwargs):
+        kwargs.setdefault("timeout", timeout)
+        return request_fn(*args, **kwargs)
+    return wrapped
 
 
-def _build_verify_payload(login_data: dict, code: str) -> dict:
-    """Construct verification payload based on what Bambu's login response includes."""
-    payload: dict = {}
-
-    # Carry forward the account identifier
-    for key in ("account", "email", "username", "uid", "userId"):
-        if key in login_data:
-            payload["account"] = login_data[key]
-            break
-
-    # Different API versions use different field names for the code
-    # Try to match what the login response suggests
-    code_key = "code"
-    if "tfaKey" in login_data or "tfa_key" in login_data:
-        code_key = "tfaCode"
-        payload["tfaKey"] = login_data.get("tfaKey") or login_data.get("tfa_key")
-    elif "verifyKey" in login_data or "verify_key" in login_data:
-        code_key = "verifyCode"
-        payload["verifyKey"] = login_data.get("verifyKey") or login_data.get("verify_key")
-
-    payload[code_key] = code
-    return payload
-
-
-def _pick_verify_path(data: dict) -> str:
-    """Some Bambu endpoints use different verify paths."""
-    if "tfaKey" in data or "tfa_key" in data:
-        return "/v1/user-service/user/login"
-    # Default: same login endpoint, different payload
-    return "/v1/user-service/user/login"
-
-
-# ---- Utility: test if a token is valid ------------------------------------
+# ---- Token validation ------------------------------------------------------
 
 def validate_token(token: str, region: str = "global", timeout: float = AUTH_TIMEOUT) -> bool:
-    """Check whether a token is still valid by hitting the devices endpoint."""
-    base = _base_for_region(region)
+    """Return True if the token is still valid (GET /v1/user-service/my/profile)."""
+    if not token:
+        return False
     try:
-        with httpx.Client(timeout=timeout, headers={
-            **_headers(),
-            "Authorization": f"Bearer {token}",
-        }) as client:
-            resp = client.get(f"{base}/v1/user-service/my/devices")
-            return resp.status_code < 400
-    except httpx.HTTPError:
+        BambuAuthenticator, _BambuAuthError, _BambuClient = _import_bambulab()
+    except AuthError:
+        return False
+    try:
+        authenticator = BambuAuthenticator(
+            region=_region_key(region),
+            token_file=str(TOKEN_FILE),
+        )
+        return bool(authenticator.verify_token(token))
+    except Exception:
         return False

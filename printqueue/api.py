@@ -1,36 +1,81 @@
-"""Bambu Lab Cloud API client.
+"""Bambu Lab cloud layer for PrintQueue.
 
-James's P1S is in Cloud mode (LAN-only disabled), so we hit the Bambu
-Cloud REST API at api.bambulab.com. Auth = bearer token from
-https://bambulab.com/en/account.
+Architecture
+------------
+Bambu's cloud has NO REST endpoint that returns live printer telemetry
+(the old ``POST /v1/user-service/my/printer/{id}`` route this app used to
+poll is fiction — it 404s). Live status is only available over the cloud
+MQTT broker. So this module splits responsibilities:
 
-Design goals:
-- Never raise from the poll path — always return a PrinterStatus.
-- If no token is configured → status = "unconfigured" (not "offline").
-- Best-effort JSON parsing: Bambu's cloud payloads have evolved, so we
-  probe several field names and fall back cleanly.
-- Sync (`poll`) + async (`poll_async`) variants; TUI uses async.
+- **REST** (``bambulab.client.BambuClient``) — identity + device list:
+  resolve the account ``uid`` (needed as the MQTT username) and enumerate
+  bound devices (``v1/iot-service/api/user/bind``). Each bind record also
+  carries a coarse ``online`` flag and ``print_status`` string, which we
+  keep as a degraded fallback.
+- **MQTT** (``bambulab.mqtt.MQTTClient``) — real telemetry. Subscribe to
+  ``device/{serial}/report``; send a ``pushall`` to get a full snapshot.
+  P1-series printers stream partial *deltas* after the first full report,
+  so the async listener accumulates them under a lock.
+- **REST bind fallback** — when MQTT can't connect (network, region, auth)
+  we degrade to the bind record's online/print_status so the app still
+  shows *something* useful instead of raising.
 
-The endpoint shapes below match publicly documented / community-reversed
-Bambu Cloud routes. If Bambu changes them, the graceful-degrade paths
-still keep the app usable for queue management.
+Guarantees
+----------
+- ``poll`` / ``poll_async`` / ``list_devices`` / ``close`` NEVER raise.
+  Every failure becomes a ``PrinterStatus`` with ``online=False`` and a
+  human-useful ``error`` string.
+- No token → ``state="unconfigured"`` (not "offline").
+- ``bambulab`` not installed → ``state="offline"`` with a pip hint, so a
+  queue-only install keeps working. The library is imported lazily inside
+  methods, never at module import time.
+
+This talks to Bambu's unofficial, reverse-engineered cloud API (via the
+``bambu-lab-cloud-api`` package). Endpoints/fields can change without
+notice; the graceful-degrade paths keep the rest of the app usable.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, asdict, field
+import asyncio
+import threading
+import time
+from dataclasses import asdict, dataclass, field
 from typing import Any, Optional
 
-import httpx
-
-from .config import BAMBU_CLOUD_BASE, Config
+# NOTE: we deliberately do NOT import `bambulab` at module top — a missing
+# install must not break `import printqueue.api` for queue-only users.
 
 DEFAULT_TIMEOUT = 5.0  # cloud is slower than LAN; still short enough for a TUI
+
+# How long to wait for the MQTT socket/CONNACK and for the first report.
+_CONNECT_BUDGET = 5.0      # seconds to wait for `.connected` to flip true
+_REPORT_BUDGET = 8.0       # seconds to wait for the first "print" report
+_RECONNECT_INTERVAL = 15.0  # min seconds between async reconnect attempts
+
+# gcode_state → status.state. Anything not listed is lowercased as-is
+# (FINISH→finish, FAILED→failed, IDLE→idle).
+_STATE_MAP = {
+    "RUNNING": "printing",
+    "PAUSE": "paused",
+}
+
+# Keys that count as "real telemetry". An accumulated dict must contain at
+# least one of these before we claim online=True — an empty or unrecognized
+# report must not masquerade as "online, idle".
+_TELEMETRY_KEYS = frozenset({
+    "gcode_state", "mc_percent", "mc_remaining_time",
+    "nozzle_temper", "bed_temper", "nozzle_target_temper",
+    "bed_target_temper", "subtask_name", "ams",
+    # tolerant legacy aliases
+    "state", "print_status", "progress", "print_progress",
+    "remaining_time", "nozzle_temp", "bed_temp", "gcode_file",
+})
 
 
 @dataclass
 class PrinterStatus:
     online: bool
-    source: str = "cloud"          # cloud / lan / none
+    source: str = "cloud-mqtt"     # cloud-mqtt / cloud-rest / none
     state: str = "unknown"         # idle / printing / paused / error / offline / unconfigured
     device_id: Optional[str] = None
     device_name: Optional[str] = None
@@ -52,291 +97,467 @@ class PrinterStatus:
         return d
 
 
+# --------------------------------------------------------------------------
+# helpers (module-level, pure — easy to unit test)
+# --------------------------------------------------------------------------
+
+def _map_state(raw: Any) -> str:
+    """Map a Bambu gcode_state / print_status to our lowercase vocabulary."""
+    if raw is None or raw == "":
+        return "idle"
+    return _STATE_MAP.get(str(raw).upper(), str(raw).lower())
+
+
+def _format_color(raw: Any) -> Optional[str]:
+    """tray_color is RRGGBBAA hex. Surface as #RRGGBB (alpha stripped) when
+    it looks like hex, otherwise return the raw value untouched."""
+    if raw is None or raw == "":
+        return None
+    s = str(raw).strip()
+    h = s[1:] if s.startswith("#") else s
+    if len(h) in (6, 8) and all(c in "0123456789abcdefABCDEF" for c in h):
+        return "#" + h[:6].upper()
+    return s
+
+
+def _to_float(v: Any) -> float:
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _to_int(v: Any) -> int:
+    try:
+        return int(float(v))
+    except (TypeError, ValueError):
+        return 0
+
+
+# --------------------------------------------------------------------------
+# client
+# --------------------------------------------------------------------------
+
 class BambuCloudClient:
-    """HTTP client for the Bambu Lab Cloud API.
+    """Cloud client for a single Bambu printer.
 
     Usage:
         client = BambuCloudClient.from_config(cfg)
-        status = client.poll()          # sync
-        status = await client.poll_async()  # async (used by TUI)
+        status = client.poll()               # sync, one-shot (pq status)
+        status = await client.poll_async()   # async, persistent listener (TUI)
+        client.close()                       # tear down MQTT
     """
 
     def __init__(
         self,
         access_token: Optional[str] = None,
+        uid: Optional[str] = None,
         device_id: Optional[str] = None,
-        base_url: str = BAMBU_CLOUD_BASE,
+        region: str = "global",
         timeout: float = DEFAULT_TIMEOUT,
     ) -> None:
         self.access_token = access_token
+        self.uid = str(uid) if uid else None
         self.device_id = device_id
-        self.base_url = base_url.rstrip("/")
+        self.region = "china" if str(region).lower() in ("china", "cn") else "global"
         self.timeout = timeout
+        # REST is chattier than MQTT setup; give it a slightly longer budget.
+        self._rest_timeout = max(int(round(timeout)), 10)
+
+        # --- resolved identity cache (populated on first successful REST call) ---
+        self._identity_ok = False
+        self._dev_id: Optional[str] = None
+        self._dev_name: Optional[str] = None
+        self._bind_online: bool = False
+        self._bind_print_status: Optional[str] = None
+
+        # --- persistent async MQTT listener state ---
+        self._listener: Any = None                 # bambulab.mqtt.MQTTClient
+        self._acc_state: dict[str, Any] = {}       # accumulated "print" dict
+        self._acc_lock = threading.Lock()
+        self._last_msg_ts: Optional[float] = None
+        self._last_reconnect_attempt: float = 0.0
 
     @classmethod
-    def from_config(cls, cfg: Config, timeout: float = DEFAULT_TIMEOUT) -> "BambuCloudClient":
+    def from_config(cls, cfg, timeout: float = DEFAULT_TIMEOUT) -> "BambuCloudClient":
+        cloud_base = getattr(cfg, "cloud_base", "") or ""
+        region = "china" if "bambulab.cn" in cloud_base else "global"
         return cls(
             access_token=cfg.access_token,
+            uid=cfg.uid,
             device_id=cfg.device_id,
-            base_url=cfg.cloud_base or BAMBU_CLOUD_BASE,
+            region=region,
             timeout=timeout,
         )
 
-    # ---- Public API -------------------------------------------------------
+    # ---- public: identity helpers (kept static for cli/back-compat) -------
+    @staticmethod
+    def pick_id(device: dict[str, Any]) -> Optional[str]:
+        for key in ("dev_id", "device_id", "id", "sn"):
+            v = device.get(key)
+            if v:
+                return str(v)
+        return None
+
+    @staticmethod
+    def pick_name(device: dict[str, Any]) -> Optional[str]:
+        for key in ("name", "dev_name", "device_name"):
+            v = device.get(key)
+            if v:
+                return str(v)
+        return None
+
+    # back-compat aliases (older callers used the underscored names)
+    _pick_id = pick_id
+    _pick_name = pick_name
+
     @property
     def configured(self) -> bool:
         return bool(self.access_token)
 
-    def _unconfigured_status(self) -> PrinterStatus:
-        return PrinterStatus(
-            online=False,
-            source="none",
-            state="unconfigured",
-            configured=False,
-            error="No Bambu Cloud token configured. Run: pq config --token <TOKEN>",
-        )
-
-    def _headers(self) -> dict[str, str]:
-        return {
-            "Authorization": f"Bearer {self.access_token}",
-            "Accept": "application/json",
-            "User-Agent": "PrintQueue/0.1 (+https://github.com/jsl)",
-        }
-
+    # ---- public API -------------------------------------------------------
     def poll(self) -> PrinterStatus:
+        """One-shot synchronous poll (used by `pq status`).
+
+        Resolve identity over REST → connect MQTT → pushall → wait for one
+        report → parse. Any MQTT failure degrades to the REST bind status.
+        """
         if not self.configured:
             return self._unconfigured_status()
+        if not _bambulab_available():
+            return self._import_error_status()
+
+        ok, err = self._resolve_identity()
+        if not ok:
+            return PrinterStatus(
+                online=False, source="cloud-rest", state="offline",
+                device_id=self.device_id, error=err,
+            )
+
+        if self.region != "global":
+            return self._bind_status(
+                error="cloud MQTT telemetry is only wired for the global "
+                      "region (broker us.mqtt.bambulab.com); showing cloud bind status",
+            )
+        if not self.uid:
+            return self._bind_status(
+                error="MQTT unavailable: could not resolve account uid; "
+                      "showing cloud bind status",
+            )
+
         try:
-            with httpx.Client(timeout=self.timeout, base_url=self.base_url,
-                              headers=self._headers()) as client:
-                device = self._resolve_device_sync(client)
-                if device is None:
-                    return PrinterStatus(
-                        online=False, source="cloud", state="offline",
-                        error="No printers found on this Bambu account",
-                    )
-                return self._fetch_status_sync(client, device)
-        except httpx.HTTPStatusError as exc:
-            code = exc.response.status_code if exc.response is not None else 0
-            return PrinterStatus(
-                online=False, source="cloud", state="offline",
-                error=f"HTTP {code} from Bambu Cloud",
+            print_node = self._mqtt_oneshot()
+        except Exception as exc:  # never propagate
+            return self._bind_status(
+                error=f"MQTT unavailable ({exc}); showing cloud bind status",
             )
-        except (httpx.HTTPError, ValueError) as exc:
-            return PrinterStatus(
-                online=False, source="cloud", state="offline",
-                error=str(exc),
+        if not print_node:
+            return self._bind_status(
+                error="no MQTT telemetry received (timeout); showing cloud bind status",
             )
+        return self._parse(print_node, source="cloud-mqtt")
 
     async def poll_async(self) -> PrinterStatus:
+        """Async poll for the Textual TUI (called every ~5s).
+
+        Never blocks the event loop: all blocking work runs in a worker
+        thread. A persistent MQTT listener accumulates report deltas; each
+        call just snapshots and parses the accumulated state.
+        """
         if not self.configured:
             return self._unconfigured_status()
         try:
-            async with httpx.AsyncClient(timeout=self.timeout, base_url=self.base_url,
-                                         headers=self._headers()) as client:
-                device = await self._resolve_device_async(client)
-                if device is None:
-                    return PrinterStatus(
-                        online=False, source="cloud", state="offline",
-                        error="No printers found on this Bambu account",
-                    )
-                return await self._fetch_status_async(client, device)
-        except httpx.HTTPStatusError as exc:
-            code = exc.response.status_code if exc.response is not None else 0
+            return await asyncio.to_thread(self._poll_async_worker)
+        except Exception as exc:  # belt & suspenders — worker already guards
             return PrinterStatus(
-                online=False, source="cloud", state="offline",
-                error=f"HTTP {code} from Bambu Cloud",
-            )
-        except (httpx.HTTPError, ValueError) as exc:
-            return PrinterStatus(
-                online=False, source="cloud", state="offline",
-                error=str(exc),
+                online=False, source="cloud-rest", state="offline",
+                device_id=self.device_id, error=str(exc),
             )
 
-    # ---- Device listing --------------------------------------------------
     def list_devices(self) -> list[dict[str, Any]]:
-        """Return raw device list (best-effort). Empty list on failure."""
-        if not self.configured:
+        """Return the raw bound-device list. Empty list on any failure."""
+        if not self.configured or not _bambulab_available():
             return []
         try:
-            with httpx.Client(timeout=self.timeout, base_url=self.base_url,
-                              headers=self._headers()) as client:
-                return self._get_devices_sync(client)
-        except (httpx.HTTPError, ValueError):
+            client = self._lib_client()
+            devices = client.get_devices()
+        except Exception:
             return []
+        return [d for d in devices if isinstance(d, dict)]
 
-    def _get_devices_sync(self, client: httpx.Client) -> list[dict[str, Any]]:
-        resp = client.get("/user-service/my/devices")
-        resp.raise_for_status()
-        return self._extract_devices(resp.json())
+    def close(self) -> None:
+        """Tear down the persistent MQTT listener. Safe to call anytime."""
+        listener = self._listener
+        self._listener = None
+        if listener is not None:
+            try:
+                listener.disconnect()
+            except Exception:
+                pass
 
-    async def _get_devices_async(self, client: httpx.AsyncClient) -> list[dict[str, Any]]:
-        resp = await client.get("/user-service/my/devices")
-        resp.raise_for_status()
-        return self._extract_devices(resp.json())
+    # ---- REST identity resolution ----------------------------------------
+    def _lib_client(self):
+        from bambulab.client import BambuClient as _LibClient
+        client = _LibClient(self.access_token, timeout=self._rest_timeout)
+        if self.region == "china":
+            client.BASE_URL = "https://api.bambulab.cn"
+        return client
 
-    @staticmethod
-    def _extract_devices(payload: Any) -> list[dict[str, Any]]:
-        if isinstance(payload, dict):
-            for key in ("devices", "device_list", "data", "result"):
-                v = payload.get(key)
-                if isinstance(v, list):
-                    return [d for d in v if isinstance(d, dict)]
-            # single-device dict?
-            if any(k in payload for k in ("dev_id", "device_id", "sn")):
-                return [payload]
-        if isinstance(payload, list):
-            return [d for d in payload if isinstance(d, dict)]
-        return []
+    def _resolve_identity(self) -> tuple[bool, Optional[str]]:
+        """Resolve uid + target device over REST, caching bind fallback data.
 
-    @staticmethod
-    def _pick_id(device: dict[str, Any]) -> Optional[str]:
-        for key in ("dev_id", "device_id", "id", "sn", "serial"):
-            v = device.get(key)
-            if v:
-                return str(v)
-        return None
+        Returns (ok, error). Cached after the first success.
+        """
+        if self._identity_ok:
+            return True, None
+        try:
+            client = self._lib_client()
+            if not self.uid:
+                info = client.get_user_info()
+                uid = info.get("uid") if isinstance(info, dict) else None
+                if uid is not None:
+                    self.uid = str(uid)
+            devices = client.get_devices()
+        except Exception as exc:
+            return False, _friendly_error(exc)
 
-    @staticmethod
-    def _pick_name(device: dict[str, Any]) -> Optional[str]:
-        for key in ("name", "dev_name", "device_name", "nickname"):
-            v = device.get(key)
-            if v:
-                return str(v)
-        return None
+        device = self._match_device([d for d in devices if isinstance(d, dict)])
+        if device is None:
+            return False, "no printers bound to this Bambu account"
 
-    def _resolve_device_sync(self, client: httpx.Client) -> Optional[dict[str, Any]]:
-        devices = self._get_devices_sync(client)
-        return self._match_device(devices)
-
-    async def _resolve_device_async(self, client: httpx.AsyncClient) -> Optional[dict[str, Any]]:
-        devices = await self._get_devices_async(client)
-        return self._match_device(devices)
+        self._dev_id = self.pick_id(device) or self.device_id
+        self._dev_name = self.pick_name(device)
+        self._bind_online = bool(device.get("online"))
+        self._bind_print_status = device.get("print_status")
+        self._identity_ok = True
+        return True, None
 
     def _match_device(self, devices: list[dict[str, Any]]) -> Optional[dict[str, Any]]:
         if not devices:
             return None
         if self.device_id:
             for d in devices:
-                if self._pick_id(d) == self.device_id:
+                if self.pick_id(d) == self.device_id:
                     return d
-        # fall back to the first device
         return devices[0]
 
-    # ---- Status fetch -----------------------------------------------------
-    def _fetch_status_sync(self, client: httpx.Client, device: dict[str, Any]) -> PrinterStatus:
-        dev_id = self._pick_id(device)
-        # The cloud "printer/{id}" POST returns the latest cached telemetry.
-        payload_body = {"command": "get_status"}
-        try:
-            resp = client.post(f"/user-service/my/printer/{dev_id}", json=payload_body)
-            if resp.status_code == 405 or resp.status_code == 404:
-                # Some firmwares expose GET instead. Try that.
-                resp = client.get(f"/user-service/my/printer/{dev_id}")
-            resp.raise_for_status()
-            data = resp.json()
-        except (httpx.HTTPError, ValueError) as exc:
-            # We at least know the device exists; report it as offline w/ device meta.
-            return PrinterStatus(
-                online=False,
-                source="cloud",
-                state="offline",
-                device_id=dev_id,
-                device_name=self._pick_name(device),
-                error=str(exc),
-            )
-        return self._parse(data, device)
+    def _bind_status(self, error: Optional[str] = None,
+                     source: str = "cloud-rest") -> PrinterStatus:
+        """Degraded status derived from the REST bind record."""
+        return PrinterStatus(
+            online=bool(self._bind_online),
+            source=source,
+            state=_map_state(self._bind_print_status),
+            device_id=self._dev_id or self.device_id,
+            device_name=self._dev_name,
+            error=error,
+        )
 
-    async def _fetch_status_async(self, client: httpx.AsyncClient, device: dict[str, Any]) -> PrinterStatus:
-        dev_id = self._pick_id(device)
-        payload_body = {"command": "get_status"}
-        try:
-            resp = await client.post(f"/user-service/my/printer/{dev_id}", json=payload_body)
-            if resp.status_code in (404, 405):
-                resp = await client.get(f"/user-service/my/printer/{dev_id}")
-            resp.raise_for_status()
-            data = resp.json()
-        except (httpx.HTTPError, ValueError) as exc:
-            return PrinterStatus(
-                online=False,
-                source="cloud",
-                state="offline",
-                device_id=dev_id,
-                device_name=self._pick_name(device),
-                error=str(exc),
-            )
-        return self._parse(data, device)
+    # ---- MQTT: one-shot (sync poll) --------------------------------------
+    def _mqtt_oneshot(self) -> Optional[dict[str, Any]]:
+        from bambulab.mqtt import MQTTClient, MQTTError
 
-    # ---- Parsing ---------------------------------------------------------
-    def _parse(self, data: Any, device: dict[str, Any]) -> PrinterStatus:
-        """Best-effort parse. Bambu Cloud payload shapes have varied over
-        firmware versions — we probe a handful of common keys and fall
-        back to a benign 'idle' status.
+        got = threading.Event()
+        holder: dict[str, Any] = {}
+
+        def on_msg(_dev_id: str, data: Any) -> None:
+            if isinstance(data, dict) and isinstance(data.get("print"), dict):
+                holder["print"] = data["print"]
+                got.set()
+
+        client = MQTTClient(
+            username=self.uid,
+            access_token=self.access_token,
+            device_id=self._dev_id,
+            on_message=on_msg,
+        )
+        try:
+            client.connect(blocking=False)
+            deadline = time.monotonic() + _CONNECT_BUDGET
+            while not client.connected and time.monotonic() < deadline:
+                time.sleep(0.1)
+            if not client.connected:
+                raise MQTTError("broker connect timed out")
+            client.request_full_status()
+            got.wait(timeout=_REPORT_BUDGET)
+            return holder.get("print")
+        finally:
+            try:
+                client.disconnect()
+            except Exception:
+                pass
+
+    # ---- MQTT: persistent listener (async poll) --------------------------
+    def _poll_async_worker(self) -> PrinterStatus:
+        if not _bambulab_available():
+            return self._import_error_status()
+
+        ok, err = self._resolve_identity()
+        if not ok:
+            return PrinterStatus(
+                online=False, source="cloud-rest", state="offline",
+                device_id=self.device_id, error=err,
+            )
+
+        if self.region != "global":
+            return self._bind_status(
+                error="cloud MQTT telemetry is only wired for the global "
+                      "region; showing cloud bind status",
+            )
+        if not self.uid:
+            return self._bind_status(
+                error="MQTT unavailable: could not resolve account uid; "
+                      "showing cloud bind status",
+            )
+
+        self._ensure_listener()
+
+        with self._acc_lock:
+            snapshot = dict(self._acc_state)
+
+        if not snapshot:
+            return self._bind_status(error="waiting for first MQTT report…")
+
+        return self._parse(snapshot, source="cloud-mqtt")
+
+    def _ensure_listener(self) -> None:
+        """Start (or reconnect) the background MQTT listener if needed.
+
+        Reconnect attempts are rate-limited to one per ~15s so a dead
+        network doesn't spam connect attempts.
         """
-        node: dict[str, Any] = {}
-        if isinstance(data, dict):
-            # common wrappers
-            for key in ("print", "status", "data", "result", "report"):
-                v = data.get(key)
-                if isinstance(v, dict):
-                    node = v
-                    break
-            if not node:
-                node = data
+        listener = self._listener
+        if listener is not None and listener.connected:
+            return
 
-        state = str(
+        now = time.monotonic()
+        # Rate-limit reconnects, but always allow the very first attempt.
+        if listener is not None and (now - self._last_reconnect_attempt) < _RECONNECT_INTERVAL:
+            return
+        self._last_reconnect_attempt = now
+
+        # Tear down a stale/disconnected listener before making a new one.
+        if listener is not None:
+            try:
+                listener.disconnect()
+            except Exception:
+                pass
+            self._listener = None
+
+        from bambulab.mqtt import MQTTClient
+
+        def on_msg(_dev_id: str, data: Any) -> None:
+            if isinstance(data, dict) and isinstance(data.get("print"), dict):
+                self._accumulate(data["print"])
+
+        client = MQTTClient(
+            username=self.uid,
+            access_token=self.access_token,
+            device_id=self._dev_id,
+            on_message=on_msg,
+        )
+        try:
+            client.connect(blocking=False)
+        except Exception:
+            self._listener = None
+            return
+        self._listener = client
+
+        # Wait briefly for CONNACK, then request a full snapshot once.
+        deadline = time.monotonic() + _CONNECT_BUDGET
+        while not client.connected and time.monotonic() < deadline:
+            time.sleep(0.1)
+        if client.connected:
+            try:
+                client.request_full_status()
+            except Exception:
+                pass
+
+    def _accumulate(self, print_delta: dict[str, Any]) -> dict[str, Any]:
+        """Merge one report's "print" dict into the accumulated state.
+
+        P1-series printers send partial deltas after the first full report,
+        so a shallow update is correct. Returns a snapshot copy (handy for
+        tests). Thread-safe.
+        """
+        with self._acc_lock:
+            self._acc_state.update(print_delta)
+            self._last_msg_ts = time.monotonic()
+            return dict(self._acc_state)
+
+    # ---- status shaping ---------------------------------------------------
+    def _unconfigured_status(self) -> PrinterStatus:
+        return PrinterStatus(
+            online=False,
+            source="none",
+            state="unconfigured",
+            configured=False,
+            error="No Bambu Cloud token configured. Run: pq login",
+        )
+
+    def _import_error_status(self) -> PrinterStatus:
+        return PrinterStatus(
+            online=False,
+            source="none",
+            state="offline",
+            error="bambu-lab-cloud-api not installed — run: "
+                  "pip install bambu-lab-cloud-api",
+        )
+
+    def _parse(self, print_node: Any, source: str = "cloud-mqtt") -> PrinterStatus:
+        """Build a PrinterStatus from an accumulated "print" dict.
+
+        Tolerant field probing, but requires at least one recognized
+        telemetry field before claiming online=True: an empty or
+        unrecognized dict must NOT parse as "online, idle".
+        """
+        node: dict[str, Any] = print_node if isinstance(print_node, dict) else {}
+        dev_id = self._dev_id or self.device_id
+        dev_name = self._dev_name
+
+        if not (_TELEMETRY_KEYS & node.keys()):
+            return PrinterStatus(
+                online=False,
+                source=source,
+                state="unknown",
+                device_id=dev_id,
+                device_name=dev_name,
+                error="no recognized telemetry fields in report",
+                raw=node or None,
+            )
+
+        state = _map_state(
             node.get("gcode_state")
             or node.get("state")
-            or node.get("mc_print_stage")
             or node.get("print_status")
-            or "idle"
-        ).lower()
+        )
 
-        progress = float(
+        progress = _to_float(
             node.get("mc_percent")
-            or node.get("progress")
-            or node.get("print_progress")
-            or 0
+            if node.get("mc_percent") is not None
+            else node.get("progress", node.get("print_progress"))
         )
-        remaining = int(
+        remaining = _to_int(
             node.get("mc_remaining_time")
-            or node.get("remaining_time")
-            or node.get("time_remaining")
-            or 0
+            if node.get("mc_remaining_time") is not None
+            else node.get("remaining_time")
         )
-        nozzle = float(node.get("nozzle_temper") or node.get("nozzle_temp") or 0)
-        bed = float(node.get("bed_temper") or node.get("bed_temp") or 0)
-        target_nozzle = float(node.get("nozzle_target_temper") or node.get("target_nozzle") or 0)
-        target_bed = float(node.get("bed_target_temper") or node.get("target_bed") or 0)
+        nozzle = _to_float(node.get("nozzle_temper", node.get("nozzle_temp")))
+        bed = _to_float(node.get("bed_temper", node.get("bed_temp")))
+        target_nozzle = _to_float(node.get("nozzle_target_temper", node.get("target_nozzle")))
+        target_bed = _to_float(node.get("bed_target_temper", node.get("target_bed")))
         current_file = (
             node.get("subtask_name")
             or node.get("gcode_file")
-            or node.get("file")
-            or node.get("print_file")
             or None
         )
 
-        # AMS filament trays (P1S w/ AMS Lite reports up to 4)
-        ams_filaments: list[dict[str, Any]] = []
-        ams_node = node.get("ams") if isinstance(node.get("ams"), dict) else None
-        if ams_node:
-            trays = ams_node.get("ams") or ams_node.get("tray") or []
-            if isinstance(trays, list):
-                for t in trays:
-                    if isinstance(t, dict):
-                        ams_filaments.append({
-                            "id": t.get("id") or t.get("tray_id"),
-                            "type": t.get("tray_type") or t.get("type"),
-                            "color": t.get("tray_color") or t.get("color"),
-                            "remaining": t.get("remain") or t.get("remaining"),
-                        })
-
         return PrinterStatus(
             online=True,
-            source="cloud",
+            source=source,
             state=state,
-            device_id=self._pick_id(device),
-            device_name=self._pick_name(device),
+            device_id=dev_id,
+            device_name=dev_name,
             progress=progress,
             remaining_minutes=remaining,
             nozzle_temp=nozzle,
@@ -344,10 +565,69 @@ class BambuCloudClient:
             target_nozzle=target_nozzle,
             target_bed=target_bed,
             current_file=current_file,
-            ams_filaments=ams_filaments,
-            raw=data if isinstance(data, dict) else None,
+            ams_filaments=self._parse_ams(node.get("ams")),
+            raw=node,
         )
 
+    @staticmethod
+    def _parse_ams(ams_node: Any) -> list[dict[str, Any]]:
+        """Flatten AMS trays across units.
 
-# Backwards-compat alias — anything importing the old LAN client keeps working.
+        Real nesting is ams.ams[] = list of AMS UNITS, each unit has a
+        tray[] list. We flatten every tray across every unit and skip empty
+        trays (no tray_type).
+        """
+        out: list[dict[str, Any]] = []
+        if not isinstance(ams_node, dict):
+            return out
+        units = ams_node.get("ams")
+        if not isinstance(units, list):
+            return out
+        for unit in units:
+            if not isinstance(unit, dict):
+                continue
+            trays = unit.get("tray")
+            if not isinstance(trays, list):
+                continue
+            for tray in trays:
+                if not isinstance(tray, dict):
+                    continue
+                ttype = tray.get("tray_type") or tray.get("type")
+                if not ttype:  # empty slot — skip
+                    continue
+                remain = tray.get("remain")
+                if remain is None:
+                    remain = tray.get("remaining")
+                out.append({
+                    "id": tray.get("id") if tray.get("id") is not None else tray.get("tray_id"),
+                    "type": ttype,
+                    "color": _format_color(tray.get("tray_color") or tray.get("color")),
+                    "remaining": remain,
+                })
+        return out
+
+
+def _bambulab_available() -> bool:
+    """True if the bambu-lab-cloud-api package can be imported."""
+    try:
+        import bambulab.client  # noqa: F401
+        return True
+    except Exception:
+        return False
+
+
+def _friendly_error(exc: Exception) -> str:
+    """Turn a library exception into an actionable one-liner."""
+    msg = str(exc)
+    if "401" in msg or "403" in msg or "unauthorized" in msg.lower():
+        code = "401" if "401" in msg else ("403" if "403" in msg else "auth")
+        return f"token rejected (HTTP {code}) — run: pq login"
+    if "timed out" in msg.lower() or "timeout" in msg.lower():
+        return f"Bambu Cloud request timed out: {msg}"
+    return f"Bambu Cloud error: {msg}"
+
+
+# Backwards-compat alias — older imports of the "BambuClient" name keep
+# working. This shadows bambulab.client.BambuClient on purpose; the library
+# class is only ever imported lazily and aliased inside methods above.
 BambuClient = BambuCloudClient

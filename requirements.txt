@@ -1,2 +1,4 @@
 textual>=0.47.0
-httpx>=0.25.0
+# Cloud auth + device list + MQTT telemetry (AGPL-3.0; pulls paho-mqtt,
+# requests, and — for features we don't use — flask + opencv-python).
+bambu-lab-cloud-api==1.0.5

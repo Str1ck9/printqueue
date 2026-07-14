@@ -2,12 +2,12 @@
 
 A terminal-based 3D print queue manager for the **Bambu Lab P1S** (Cloud mode).
 
-- 🖨️ Live printer status via the **Bambu Lab Cloud API** (`api.bambulab.com/v1`)
+- 🖨️ Live printer status via **Bambu Cloud MQTT** (REST for login/device list, MQTT for telemetry)
 - 📋 SQLite-backed print queue with priorities
 - 🧵 Filament inventory tracking (spool-level grams remaining) + AMS tray readback
 - 📊 Print history log with optional CSV export
 - 🎛️ Textual TUI dashboard **and** full CLI
-- 🌐 Works fully offline — if the API is unreachable or not configured, queue management still runs
+- 🌐 Works fully offline — if the cloud is unreachable or not configured, queue management still runs
 
 ---
 
@@ -26,11 +26,15 @@ pip install -e .
 pq --help
 ```
 
-Requires **Python 3.9+**. Dependencies: `textual`, `httpx`. SQLite is stdlib.
+Requires **Python 3.9+**. Dependencies: `textual`, `bambu-lab-cloud-api`
+(the last one is AGPL-3.0 and pulls in `paho-mqtt`, `requests`, plus `flask`/`opencv-python`
+for features we don't use). SQLite is stdlib. `./pq` automatically re-execs into
+`.venv/bin/python3` when the venv exists, so it works without activating.
 
 The database lives at `~/.printqueue/printqueue.db` and is created on first run.
-Config (Bambu Cloud API token) lives at `~/.printqueue/config.json` (mode `0600`).
-On first launch, James's default filament spools (PLA black, red, blue — Bambu, 1kg each) are seeded automatically.
+Config (Bambu Cloud token + uid + device id) lives at `~/.printqueue/config.json` (mode `0600`).
+When the database file is created for the first time, James's default filament spools
+(PLA black, red, blue — Bambu, 1kg each) are seeded automatically.
 
 ---
 
@@ -107,9 +111,12 @@ Global: `--db PATH` to override the SQLite location.
 └──────────────────────┴──────────────────────────────────┘
 ```
 
-Keys: `q` quit · `r` refresh · `s` start job · `d` mark done · `x` delete · arrows to navigate.
+Keys: `q` quit · `r` refresh · `s` start job · `d` mark done · `x` twice to delete (confirmation) · arrows to navigate.
 
-The printer panel polls every 5 seconds. If the P1S is off or unreachable, it shows **● OFFLINE** and the rest of the app keeps working normally.
+The printer panel refreshes every 5 seconds from a persistent MQTT subscription (updates
+arrive pushed, not polled). Queue/inventory/history tables also auto-refresh every 15s.
+If the P1S is off or unreachable, the panel shows **● OFFLINE** and the rest of the app
+keeps working normally. Times are displayed in your local timezone (stored as UTC).
 
 ---
 
@@ -125,44 +132,71 @@ Foreign keys are enforced (`PRAGMA foreign_keys = ON`). Deleting a spool or job 
 
 ## Bambu Lab Notes
 
-James's P1S runs in **Cloud mode** (LAN-only disabled), so status polling goes through the Bambu Lab Cloud API:
+James's P1S runs in **Cloud mode** (LAN-only disabled). There is **no official public
+Bambu Cloud API** — this app uses the community-documented (reverse-engineered) surface
+via the [`bambu-lab-cloud-api`](https://github.com/coelacant1/Bambu-Lab-Cloud-API) library:
 
-1. `GET /v1/user-service/my/devices` — list printers bound to the account.
-2. `POST /v1/user-service/my/printer/{device_id}` — request the latest telemetry (falls back to `GET` if the endpoint 404s / 405s on newer firmware).
+1. **REST** `GET /v1/iot-service/api/user/bind` — list printers bound to the account
+   (also provides a coarse online/print_status fallback).
+2. **MQTT** `us.mqtt.bambulab.com:8883` (TLS) — live telemetry. Username `u_{uid}`,
+   password = access token, topic `device/{serial}/report`. A `pushall` request is sent
+   on connect because P1-series printers otherwise only push deltas.
+
+There is no REST endpoint for live telemetry (temperatures/progress) — MQTT is the only
+source. `pq status` does a one-shot connect → pushall → report → disconnect; the TUI keeps
+a persistent subscription and renders from the latest merged report.
 
 ### Authentication
 
-**Bambu Lab does NOT expose a static API token on their website.** Authentication uses their cloud login flow:
+**Bambu Lab does NOT expose a static API token on their website.** Authentication uses
+their cloud login flow (email + password, then an emailed verification code or MFA):
 
 ```bash
 # Interactive login — prompts for email, password, and verification code
 pq login
 ```
 
-The token is stored in `~/.printqueue/config.json` (mode `0600`) and typically valid for ~3 months.
+The token (~3 months validity) and your account `uid` (needed as the MQTT username) are
+stored in `~/.printqueue/config.json` (mode `0600`).
 
-**Manual token entry** (e.g., if you extracted one via browser dev tools or a third-party tool):
+**Manual token entry** (e.g., extracted via browser dev tools) still works, but MQTT also
+needs your uid; `pq status` resolves and caches it automatically on first use:
 
 ```bash
 pq config --token <TOKEN>
 ```
 
-**Caveats:** This is an unofficial/reverse-engineered API. Bambu Lab can change or break it with any firmware/cloud update without notice. The app degrades gracefully — queue and inventory management work fully offline regardless. For a more stable path, consider switching your P1S to LAN mode and using MQTT directly.
-
-Cloud payload shapes vary across firmware versions, so the parser probes a handful of field names (`mc_percent` / `progress`, `nozzle_temper` / `nozzle_temp`, etc.) and falls back cleanly. AMS tray metadata (type/color) is surfaced in both the CLI (`pq status`) and the TUI printer panel when the cloud reports it.
+**Caveats:** This is an unofficial/reverse-engineered API. Bambu Lab has tightened
+third-party access before (January 2025 "Authorization Control") and can again — note
+that read-only telemetry is unaffected by command signing requirements, and this app
+never sends control commands. The app degrades gracefully — queue and inventory
+management work fully offline regardless. Only the **global** region broker is wired up
+(`--region china` login works, but MQTT telemetry assumes the US broker).
 
 ### Failure modes (all handled gracefully)
 
 | Situation | What you see | App still usable? |
 | --- | --- | --- |
 | No token set | `● API NOT CONFIGURED` | ✅ yes — queue/inventory work |
+| `bambu-lab-cloud-api` not installed | `● OFFLINE — cloud library missing` | ✅ yes |
 | Bambu Cloud down / no network | `● OFFLINE — <error>` | ✅ yes |
-| Token wrong / expired | `● OFFLINE — HTTP 401` | ✅ yes |
+| Token wrong / expired | `● OFFLINE — token rejected, run pq login` | ✅ yes |
 | No printers on account | `● OFFLINE — No printers found` | ✅ yes |
+| MQTT blocked but REST reachable | `● ONLINE [cloud-rest]` (coarse status only) | ✅ yes |
 
 ### LAN fallback
 
-A `lan_host` config field is still supported for anyone running LAN-only mode; if set, it's stored but the current client always uses the Cloud API. Full LAN MQTT support is left as a future enhancement.
+A `lan_host` config field is still stored for anyone running LAN-only mode, but the
+current client always uses the cloud. Full LAN MQTT support (Developer Mode) is left as
+a future enhancement.
+
+---
+
+## Tests
+
+```bash
+.venv/bin/python -m pytest tests/ -q
+```
 
 ---
 
@@ -174,10 +208,11 @@ printqueue/
 ├── pyproject.toml
 ├── requirements.txt
 ├── README.md
+├── tests/                  # pytest suite (db layer + telemetry parser)
 └── printqueue/
     ├── __init__.py
-    ├── api.py              # Bambu Cloud API client
-    ├── auth.py             # Interactive login + token validation
+    ├── api.py              # Bambu cloud client (REST identity + MQTT telemetry)
+    ├── auth.py             # Interactive login (email code / MFA) + token validation
     ├── cli.py              # argparse CLI
     ├── config.py           # ~/.printqueue/config.json manager
     ├── db.py               # SQLite layer

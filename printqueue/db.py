@@ -1,15 +1,37 @@
 """SQLite database layer for PrintQueue."""
 from __future__ import annotations
 
-import json
-import os
 import sqlite3
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator, Optional
 
 DEFAULT_DB_PATH = Path.home() / ".printqueue" / "printqueue.db"
+
+
+def _utcnow_str() -> str:
+    """UTC timestamp in the same 'YYYY-MM-DD HH:MM:SS' format SQLite uses."""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def utc_to_local_str(ts: Optional[str], fmt: str = "%Y-%m-%d %H:%M") -> str:
+    """Convert a stored UTC timestamp string to a local-time formatted string.
+
+    Accepts 'YYYY-MM-DD HH:MM:SS' or the ISO 'T'-separated variant. On None
+    returns '—'; on any parse failure returns the input unchanged.
+    """
+    if ts is None:
+        return "—"
+    try:
+        dt = datetime.fromisoformat(ts)
+    except (ValueError, TypeError):
+        return ts
+    return dt.replace(tzinfo=timezone.utc).astimezone().strftime(fmt)
+
+
+class JobError(ValueError):
+    """Raised for invalid job state transitions (e.g. double completion)."""
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS filament (
@@ -71,6 +93,7 @@ class Database:
     def __init__(self, path: Optional[Path | str] = None) -> None:
         self.path = Path(path) if path else DEFAULT_DB_PATH
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.was_created = not self.path.exists()
         self._init_schema()
 
     def _connect(self) -> sqlite3.Connection:
@@ -127,6 +150,8 @@ class Database:
             ).fetchone()
 
     def update_filament_grams(self, filament_id: int, grams_used: float) -> None:
+        if grams_used <= 0:
+            raise ValueError("grams must be > 0")
         with self.connect() as conn:
             conn.execute(
                 "UPDATE filament SET grams_remaining = MAX(0, grams_remaining - ?) WHERE id = ?",
@@ -197,7 +222,7 @@ class Database:
         valid = {"queued", "printing", "done", "failed"}
         if status not in valid:
             raise ValueError(f"status must be one of {valid}")
-        now = datetime.utcnow().isoformat(timespec="seconds")
+        now = _utcnow_str()
         with self.connect() as conn:
             if status == "printing":
                 conn.execute(
@@ -213,6 +238,63 @@ class Database:
                 conn.execute(
                     "UPDATE jobs SET status = ? WHERE id = ?", (status, job_id)
                 )
+
+    def finish_job(
+        self,
+        job_id: int,
+        failed: bool = False,
+        grams: Optional[float] = None,
+        minutes: Optional[int] = None,
+        notes: Optional[str] = None,
+    ) -> sqlite3.Row:
+        """Atomically complete a job: set status, write history, deduct filament.
+
+        Guards against double completion (raises JobError if already done/failed)
+        and does the three writes in a single transaction. Returns the job row
+        as it was before the update.
+        """
+        with self.connect() as conn:
+            job = conn.execute(
+                "SELECT * FROM jobs WHERE id = ?", (job_id,)
+            ).fetchone()
+            if job is None:
+                raise JobError(f"job #{job_id} not found")
+            if job["status"] in {"done", "failed"}:
+                raise JobError(f"job #{job_id} is already {job['status']}")
+
+            status = "failed" if failed else "done"
+            if grams is None:
+                grams = job["estimated_grams"] or 0
+            if minutes is None:
+                minutes = job["estimated_minutes"] or 0
+            now = _utcnow_str()
+
+            conn.execute(
+                "UPDATE jobs SET status = ?, finished_at = ? WHERE id = ?",
+                (status, now, job_id),
+            )
+            conn.execute(
+                """INSERT INTO history
+                   (job_id, job_name, filament_type, grams_used, minutes_taken,
+                    status, finished_at, notes)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    job_id,
+                    job["name"],
+                    job["filament_type"],
+                    grams,
+                    minutes,
+                    status,
+                    now,
+                    notes,
+                ),
+            )
+            if job["filament_id"] and grams > 0:
+                conn.execute(
+                    "UPDATE filament SET grams_remaining = MAX(0, grams_remaining - ?) WHERE id = ?",
+                    (grams, job["filament_id"]),
+                )
+        return job
 
     def delete_job(self, job_id: int) -> None:
         with self.connect() as conn:

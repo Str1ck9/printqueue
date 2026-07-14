@@ -10,7 +10,7 @@ from typing import Optional
 from .api import BambuCloudClient
 from .auth import interactive_login, validate_token, AuthError
 from .config import Config, load_config, save_config, DEFAULT_CONFIG_PATH, BAMBU_CLOUD_BASE
-from .db import Database, PRIORITY_ORDER
+from .db import Database, JobError, PRIORITY_ORDER, utc_to_local_str
 
 
 def _fmt_grams(row) -> str:
@@ -65,24 +65,16 @@ def cmd_start(args, db: Database) -> int:
 
 
 def cmd_done(args, db: Database) -> int:
-    job = db.get_job(args.job_id)
-    if not job:
-        print(f"error: job #{args.job_id} not found", file=sys.stderr)
+    try:
+        job = db.finish_job(
+            args.job_id, failed=args.failed, grams=args.grams, minutes=args.minutes
+        )
+    except JobError as exc:
+        print(f"error: {exc}", file=sys.stderr)
         return 1
     status = "failed" if args.failed else "done"
-    db.set_job_status(args.job_id, status)
     grams = args.grams if args.grams is not None else (job["estimated_grams"] or 0)
     minutes = args.minutes if args.minutes is not None else (job["estimated_minutes"] or 0)
-    db.add_history(
-        job_id=args.job_id,
-        job_name=job["name"],
-        filament_type=job["filament_type"],
-        grams_used=grams,
-        minutes_taken=minutes,
-        status=status,
-    )
-    if job["filament_id"] and grams:
-        db.update_filament_grams(job["filament_id"], grams)
     icon = "✅" if status == "done" else "❌"
     print(f"{icon} Job #{args.job_id} ({job['name']}) → {status}  ({grams:.0f}g, {minutes}m)")
     return 0
@@ -120,7 +112,11 @@ def cmd_inventory(args, db: Database) -> int:
         print(f"🗑  Removed filament #{args.filament_id}")
         return 0
     if args.sub == "use":
-        db.update_filament_grams(args.filament_id, args.grams)
+        try:
+            db.update_filament_grams(args.filament_id, args.grams)
+        except ValueError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
         print(f"− Used {args.grams:.0f}g from filament #{args.filament_id}")
         return 0
     # default: list
@@ -146,7 +142,9 @@ def cmd_status(args, db: Database) -> int:
     if not s.online:
         print(f"● OFFLINE  ({label})  — {s.error or 'unreachable'}")
         return 0
-    print(f"● ONLINE  ({label})  [cloud]")
+    print(f"● ONLINE  ({label})  [{s.source}]")
+    if s.error:
+        print(f"  note:      {s.error}")
     print(f"  state:     {s.state}")
     print(f"  file:      {s.current_file or '—'}")
     print(f"  progress:  {s.progress:.1f}%")
@@ -195,12 +193,14 @@ def cmd_devices(args, db: Database) -> int:
     if not devices:
         print("(no devices returned — check token or network)")
         return 0
-    print(f"{'DEVICE_ID':<24}  NAME")
-    print("-" * 50)
+    print(f"{'DEVICE_ID':<24}  {'ONLINE':<7}  {'STATUS':<10}  NAME")
+    print("-" * 64)
     for d in devices:
-        dev_id = client._pick_id(d) or "—"
-        name = client._pick_name(d) or "—"
-        print(f"{dev_id:<24}  {name}")
+        dev_id = client.pick_id(d) or "—"
+        name = client.pick_name(d) or "—"
+        online = "yes" if d.get("online") else "no"
+        pstatus = str(d.get("print_status") or "—")
+        print(f"{dev_id:<24}  {online:<7}  {pstatus:<10}  {name}")
     return 0
 
 
@@ -218,10 +218,11 @@ def cmd_history(args, db: Database) -> int:
                              r["filament_type"], r["grams_used"],
                              r["minutes_taken"], r["status"], r["notes"] or ""])
         return 0
-    print(f"{'WHEN':<20}  {'STATUS':<8}  {'GRAMS':>6}  {'MINS':>5}  NAME")
+    print(f"{'WHEN (local)':<20}  {'STATUS':<8}  {'GRAMS':>6}  {'MINS':>5}  NAME")
     print("-" * 70)
     for r in rows:
-        print(f"{r['finished_at']:<20}  {r['status']:<8}  "
+        when = utc_to_local_str(r["finished_at"])
+        print(f"{when:<20}  {r['status']:<8}  "
               f"{r['grams_used']:>6.0f}  {r['minutes_taken']:>5}  {r['job_name']}")
     return 0
 
@@ -242,7 +243,7 @@ def cmd_dashboard(args, db: Database) -> int:
 def cmd_login(args, db: Database) -> int:
     """Interactive Bambu Cloud login — gets a token and saves it."""
     try:
-        token = interactive_login(region=args.region)
+        result = interactive_login(region=args.region)
     except AuthError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
@@ -251,11 +252,13 @@ def cmd_login(args, db: Database) -> int:
         return 130
 
     cfg = load_config()
-    cfg.access_token = token
+    cfg.access_token = result.token
+    if result.uid:
+        cfg.uid = str(result.uid)
     save_config(cfg)
 
     # Validate it works
-    if validate_token(token):
+    if validate_token(result.token):
         print(f"\n✅ Token saved to {DEFAULT_CONFIG_PATH}", file=sys.stderr)
         print("   Run 'pq devices' to verify your printers are visible.", file=sys.stderr)
     else:
@@ -392,7 +395,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     db = Database(args.db) if args.db else Database()
-    # first-run seed
+    # First-run seed: a brand-new DB gets James's default spools (see README).
+    if db.was_created:
+        db.seed_defaults()
     try:
         return args.func(args, db)
     except KeyboardInterrupt:

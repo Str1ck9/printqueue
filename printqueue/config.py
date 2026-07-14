@@ -21,6 +21,7 @@ BAMBU_CLOUD_BASE = "https://api.bambulab.com/v1"
 @dataclass
 class Config:
     access_token: Optional[str] = None
+    uid: Optional[str] = None  # Bambu account uid — MQTT username is u_{uid}
     device_id: Optional[str] = None
     cloud_base: str = BAMBU_CLOUD_BASE
     # Legacy LAN fallback — retained for users still running LAN-only mode.
@@ -56,10 +57,11 @@ def load_config(path: Optional[Path | str] = None) -> Config:
         return Config()
     if not isinstance(raw, dict):
         return Config()
-    known = {"access_token", "device_id", "cloud_base", "lan_host"}
+    known = {"access_token", "uid", "device_id", "cloud_base", "lan_host"}
     extra = {k: v for k, v in raw.items() if k not in known}
     return Config(
         access_token=raw.get("access_token"),
+        uid=str(raw["uid"]) if raw.get("uid") is not None else None,
         device_id=raw.get("device_id"),
         cloud_base=raw.get("cloud_base") or BAMBU_CLOUD_BASE,
         lan_host=raw.get("lan_host"),
