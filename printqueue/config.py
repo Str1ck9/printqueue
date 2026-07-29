@@ -28,6 +28,8 @@ class Config:
     # (and future LAN MQTT). Auto-discovered/fetched when possible.
     lan_host: Optional[str] = None
     access_code: Optional[str] = None
+    # TUI color theme (see printqueue.themes) — None means default
+    theme: Optional[str] = None
     extra: dict[str, Any] = field(default_factory=dict)
 
     @property
@@ -61,7 +63,8 @@ def load_config(path: Optional[Path | str] = None) -> Config:
         return Config()
     if not isinstance(raw, dict):
         return Config()
-    known = {"access_token", "uid", "device_id", "cloud_base", "lan_host", "access_code"}
+    known = {"access_token", "uid", "device_id", "cloud_base", "lan_host",
+             "access_code", "theme"}
     extra = {k: v for k, v in raw.items() if k not in known}
     return Config(
         access_token=raw.get("access_token"),
@@ -70,6 +73,7 @@ def load_config(path: Optional[Path | str] = None) -> Config:
         cloud_base=raw.get("cloud_base") or BAMBU_CLOUD_BASE,
         lan_host=raw.get("lan_host"),
         access_code=raw.get("access_code"),
+        theme=raw.get("theme"),
         extra=extra,
     )
 

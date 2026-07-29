@@ -201,6 +201,20 @@ def cmd_config(args, db: Database) -> int:
     if args.token is not None:
         cfg.access_token = args.token.strip() or None
         changed = True
+    if args.theme is not None:
+        name = args.theme.strip().lower()
+        if name:
+            try:
+                from .themes import known_theme_names
+                names = known_theme_names()
+                if name not in names:
+                    print(f"error: unknown theme '{name}'. Known themes:\n"
+                          f"  {', '.join(names)}", file=sys.stderr)
+                    return 1
+            except ImportError:
+                pass  # textual not installed — accept as-is
+        cfg.theme = name or None
+        changed = True
     if args.device is not None:
         cfg.device_id = args.device.strip() or None
         changed = True
@@ -300,7 +314,7 @@ def cmd_dashboard(args, db: Database) -> int:
         return 1
     cfg = load_config()
     client = BambuCloudClient.from_config(cfg)
-    run_dashboard(db, client, cfg=cfg)
+    run_dashboard(db, client, cfg=cfg, theme_name=args.theme)
     return 0
 
 
@@ -442,6 +456,9 @@ def build_parser() -> argparse.ArgumentParser:
     pconf.add_argument("--lan-host", default=None, help="Printer LAN IP (camera)")
     pconf.add_argument("--access-code", default=None,
                        help="Printer LAN access code (Settings → WLAN on the printer)")
+    pconf.add_argument("--theme", default=None, metavar="NAME",
+                       help="TUI theme (e.g. c64, wildcat, textual-dark, nord — "
+                            "same list as Ctrl+P → Change theme in the dashboard)")
     pconf.add_argument("--clear", action="store_true", help="Wipe stored config")
     pconf.add_argument("--show", action="store_true", help="Print current config (redacted)")
     pconf.set_defaults(func=cmd_config)
@@ -464,6 +481,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     # dashboard
     pdash = sub.add_parser("dashboard", help="Launch the TUI dashboard")
+    pdash.add_argument("--theme", default=None, metavar="NAME",
+                       help="Theme for this run (e.g. c64, wildcat; overrides "
+                            "configured theme)")
     pdash.set_defaults(func=cmd_dashboard)
 
     # seed

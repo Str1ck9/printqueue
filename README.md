@@ -118,7 +118,34 @@ Global: `--db PATH` to override the SQLite location.
 └──────────────────────┴──────────────────────────────────┘
 ```
 
-Keys: `q` quit · `r` refresh · `s` start job · `d` mark done · `x` twice to delete (confirmation) · `a` sync AMS → inventory · `c` toggle live camera · arrows to navigate.
+Keys: `q` quit · `r` refresh · `s` start job · `d` mark done · `x` twice to delete (confirmation) · `a` sync AMS → inventory · `c` toggle live camera · `t` cycle theme · arrows to navigate.
+
+### Themes
+
+Two retro themes are registered alongside Textual's built-ins, so they show up
+in the command palette: press `Ctrl+P` → *Change theme* and pick them with live
+preview. `t` cycles stock → c64 → wildcat directly. Either way the choice is
+saved to config. You can also set one up front:
+
+```bash
+pq config --theme c64        # persist a theme (any palette theme name works)
+pq dashboard --theme wildcat # one-off override for this run
+```
+
+| Theme | Vibe |
+|-------|------|
+| `c64` | Commodore 64 boot screen — light blue on blue, block borders, inverse-video headers |
+| `wildcat` | Wildcat! BBS — double-line ANSI boxes on black, DOS-blue bars, bright yellow |
+| `textual-dark`, `nord`, `gruvbox`, … | All the stock Textual themes still work |
+
+The retro themes also swap the emoji status/priority labels for period-correct
+ASCII (`>> printing`, `!! HIGH`).
+
+![Theme picker](screenshots/theme-picker.svg)
+
+![C64 theme](screenshots/theme-c64.svg)
+
+![Wildcat BBS theme](screenshots/theme-wildcat.svg)
 
 ### AMS inventory sync
 
@@ -248,6 +275,7 @@ printqueue/
     ├── cli.py              # argparse CLI
     ├── config.py           # ~/.printqueue/config.json manager
     ├── db.py               # SQLite layer
+    ├── themes.py           # TUI color themes (default / c64 / wildcat)
     └── ui.py               # Textual TUI
 ```
 

@@ -17,6 +17,14 @@ from textual.widgets import (
 
 from .api import BambuCloudClient, PrinterStatus
 from .db import Database, JobError, utc_to_local_str
+from .themes import (
+    DEFAULT_MARKUP,
+    PQ_VARIABLE_DEFAULTS,
+    RETRO_THEMES,
+    Markup,
+    custom_themes,
+    get_markup,
+)
 
 # Camera rendering. `textual-image` probes the terminal (once, at import —
 # which is why this happens before the Textual app starts) and picks the best
@@ -43,6 +51,19 @@ STATUS_LABEL = {
     "done": "✅ done",
     "failed": "❌ failed",
 }
+# Emoji-free variants for retro themes (C64 / BBS)
+PRIORITY_LABEL_ASCII = {"high": "!! HIGH", "medium": " ! MED", "low": "   LOW"}
+STATUS_LABEL_ASCII = {
+    "queued": "-  queued",
+    "printing": ">> printing",
+    "done": "*  done",
+    "failed": "x  failed",
+}
+
+
+def _markup_of(widget) -> Markup:
+    """Markup styles for the app's active theme (safe fallback)."""
+    return getattr(widget.app, "pq_markup", DEFAULT_MARKUP)
 
 
 class PrinterPanel(Static):
@@ -51,24 +72,25 @@ class PrinterPanel(Static):
     status: reactive[Optional[PrinterStatus]] = reactive(None)
 
     def render(self) -> str:
+        t = _markup_of(self)
         s = self.status
         if s is None:
-            return "[bold cyan]Printer[/bold cyan]\n\n  polling…"
+            return f"{t.title('Printer')}\n\n  polling…"
         label = s.device_name or s.device_id or "Bambu Cloud"
         if s.state == "unconfigured":
             return (
-                f"[bold cyan]Printer[/bold cyan] [dim](cloud)[/dim]\n\n"
-                f"  [bold yellow]● API NOT CONFIGURED[/bold yellow]\n"
+                f"{t.title('Printer')} {t.dim('(cloud)')}\n\n"
+                f"  [{t.warn_style}]● API NOT CONFIGURED[/]\n"
                 f"  {s.error or 'No token set'}\n\n"
-                f"  [dim]run: pq config --token <TOKEN>[/dim]\n"
-                f"  [dim]queue management still works[/dim]"
+                f"  {t.dim('run: pq config --token <TOKEN>')}\n"
+                f"  {t.dim('queue management still works')}"
             )
         if not s.online:
             return (
-                f"[bold cyan]Printer[/bold cyan] [dim]({label})[/dim]\n\n"
-                f"  [bold red]● OFFLINE[/bold red]\n"
+                f"{t.title('Printer')} {t.dim(f'({label})')}\n\n"
+                f"  [{t.err_style}]● OFFLINE[/]\n"
                 f"  {s.error or 'unreachable'}\n\n"
-                f"  [dim]queue management still works[/dim]"
+                f"  {t.dim('queue management still works')}"
             )
         pct = f"{s.progress:5.1f}%" if s.progress else "  0.0%"
         eta = f"{s.remaining_minutes} min" if s.remaining_minutes else "—"
@@ -81,8 +103,8 @@ class PrinterPanel(Static):
             )
             ams_line = f"  ams:       {trays}\n"
         return (
-            f"[bold cyan]Printer[/bold cyan] [dim]({label})[/dim]\n\n"
-            f"  [bold green]● ONLINE[/bold green]  state: [bold]{s.state}[/bold]\n"
+            f"{t.title('Printer')} {t.dim(f'({label})')}\n\n"
+            f"  [{t.ok_style}]● ONLINE[/]  state: [{t.emph_style}]{s.state}[/]\n"
             f"  file:      {current}\n"
             f"  progress:  {pct}\n"
             f"  eta:       {eta}\n"
@@ -92,31 +114,51 @@ class PrinterPanel(Static):
         )
 
 
-class QueuePanel(Container):
+class TitledPanel(Container):
+    """Container with a themed title line above its content."""
+
+    TITLE_TEXT = ""
+
+    def compose_title(self) -> Static:
+        return Static(_markup_of(self).title(self.TITLE_TEXT), classes="panel-title")
+
+    def refresh_title(self) -> None:
+        self.query_one(".panel-title", Static).update(
+            _markup_of(self).title(self.TITLE_TEXT)
+        )
+
+
+class QueuePanel(TitledPanel):
     """Print queue table."""
 
+    TITLE_TEXT = "Print Queue"
+
     def compose(self) -> ComposeResult:
-        yield Static("[bold cyan]Print Queue[/bold cyan]", classes="panel-title")
+        yield self.compose_title()
         table = DataTable(id="queue-table", cursor_type="row", zebra_stripes=True)
         table.add_columns("ID", "Name", "Filament", "Priority", "Status", "Est.")
         yield table
 
 
-class FilamentPanel(Container):
+class FilamentPanel(TitledPanel):
     """Filament inventory table."""
 
+    TITLE_TEXT = "Filament Inventory"
+
     def compose(self) -> ComposeResult:
-        yield Static("[bold cyan]Filament Inventory[/bold cyan]", classes="panel-title")
+        yield self.compose_title()
         table = DataTable(id="filament-table", cursor_type="row", zebra_stripes=True)
         table.add_columns("ID", "Type", "Color", "Brand", "Tray", "Remaining")
         yield table
 
 
-class HistoryPanel(Container):
+class HistoryPanel(TitledPanel):
     """Recent print history."""
 
+    TITLE_TEXT = "Recent History"
+
     def compose(self) -> ComposeResult:
-        yield Static("[bold cyan]Recent History[/bold cyan]", classes="panel-title")
+        yield self.compose_title()
         table = DataTable(id="history-table", cursor_type="row", zebra_stripes=True)
         table.add_columns("When", "Name", "Status", "Grams", "Minutes")
         yield table
@@ -132,7 +174,7 @@ class CameraPanel(Container):
     """
 
     def compose(self) -> ComposeResult:
-        yield Static("[bold cyan]Camera[/bold cyan]\n\n  connecting…",
+        yield Static(f"{_markup_of(self).title('Camera')}\n\n  connecting…",
                      id="cam-status")
         if CameraImageWidget is not None:
             img = CameraImageWidget(id="cam-image")
@@ -173,13 +215,13 @@ class PrintQueueApp(App):
     }
     PrinterPanel {
         width: 40%;
-        border: round cyan;
+        border: $pq-border-type $pq-border-printer;
         padding: 1 2;
     }
     CameraPanel {
         width: 36%;
         height: 100%;
-        border: round blue;
+        border: $pq-border-type $pq-border-camera;
         padding: 0 1;
         display: none;
     }
@@ -189,17 +231,17 @@ class PrintQueueApp(App):
     }
     QueuePanel {
         width: 60%;
-        border: round green;
+        border: $pq-border-type $pq-border-queue;
         padding: 0 1;
     }
     FilamentPanel {
         width: 50%;
-        border: round yellow;
+        border: $pq-border-type $pq-border-filament;
         padding: 0 1;
     }
     HistoryPanel {
         width: 50%;
-        border: round magenta;
+        border: $pq-border-type $pq-border-history;
         padding: 0 1;
     }
     .panel-title {
@@ -207,6 +249,51 @@ class PrintQueueApp(App):
     }
     DataTable {
         height: 1fr;
+    }
+
+    /* Color overrides for retro themes — inert while the Screen lacks the
+       .pq-themed class (i.e. under the default theme). */
+    Screen.pq-themed {
+        background: $pq-bg;
+        color: $pq-fg;
+    }
+    .pq-themed Header {
+        background: $pq-header-bg;
+        color: $pq-header-fg;
+    }
+    .pq-themed Footer {
+        background: $pq-footer-bg;
+        color: $pq-footer-fg;
+    }
+    .pq-themed FooterKey {
+        background: $pq-footer-bg;
+        color: $pq-footer-fg;
+    }
+    .pq-themed FooterKey > .footer-key--key {
+        background: $pq-footer-bg;
+        color: $pq-accent;
+    }
+    .pq-themed PrinterPanel, .pq-themed CameraPanel, .pq-themed QueuePanel,
+    .pq-themed FilamentPanel, .pq-themed HistoryPanel {
+        background: $pq-bg;
+    }
+    .pq-themed DataTable {
+        background: $pq-bg;
+        color: $pq-fg;
+    }
+    .pq-themed DataTable > .datatable--header {
+        background: $pq-table-header-bg;
+        color: $pq-table-header-fg;
+    }
+    .pq-themed DataTable > .datatable--cursor {
+        background: $pq-cursor-bg;
+        color: $pq-cursor-fg;
+    }
+    .pq-themed DataTable > .datatable--odd-row {
+        background: $pq-row-odd-bg;
+    }
+    .pq-themed DataTable > .datatable--even-row {
+        background: $pq-row-even-bg;
     }
     """
 
@@ -218,12 +305,14 @@ class PrintQueueApp(App):
         Binding("x", "delete_selected", "Delete Job"),
         Binding("a", "sync_ams", "Sync AMS"),
         Binding("c", "toggle_camera", "Camera"),
+        Binding("t", "cycle_theme", "Theme"),
     ]
 
     TITLE = "PrintQueue — Bambu P1S"
 
     def __init__(self, db: Database, client: BambuCloudClient,
-                 poll_seconds: float = 5.0, cfg=None):
+                 poll_seconds: float = 5.0, cfg=None,
+                 theme_name: Optional[str] = None):
         super().__init__()
         self.db = db
         self.client = client
@@ -233,6 +322,18 @@ class PrintQueueApp(App):
         self._pending_delete: Optional[tuple[int, float]] = None
         self._camera_stream = None       # printqueue.camera.CameraStream
         self._camera_frame_ts: float = 0.0
+        # Register the retro themes so they appear in the command palette
+        # (Ctrl+P → "Change theme"), then apply the configured one.
+        for theme in custom_themes():
+            self.register_theme(theme)
+        wanted = theme_name if theme_name is not None else getattr(cfg, "theme", None)
+        if wanted and wanted in self.available_themes:
+            self.theme = wanted
+
+    @property
+    def pq_markup(self) -> Markup:
+        """Rich markup styles for the active theme."""
+        return get_markup(self.theme)
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -245,7 +346,14 @@ class PrintQueueApp(App):
             yield HistoryPanel(id="history")
         yield Footer()
 
+    def get_theme_variable_defaults(self) -> dict[str, str]:
+        # pq-* fallbacks for themes that don't define them (all built-ins);
+        # the retro themes override these via their `variables` dict.
+        return {**super().get_theme_variable_defaults(), **PQ_VARIABLE_DEFAULTS}
+
     async def on_mount(self) -> None:
+        self.screen.set_class(self.theme in RETRO_THEMES, "pq-themed")
+        self.theme_changed_signal.subscribe(self, self._on_theme_changed)
         self.refresh_tables()
         # kick off periodic printer poll
         self.set_interval(self.poll_seconds, self.poll_printer)
@@ -275,17 +383,25 @@ class PrintQueueApp(App):
         self._refresh_filament()
         self._refresh_history()
 
+    @property
+    def _labels(self) -> tuple[dict, dict]:
+        """(priority, status) label maps for the active theme."""
+        if self.pq_markup.ascii_labels:
+            return PRIORITY_LABEL_ASCII, STATUS_LABEL_ASCII
+        return PRIORITY_LABEL, STATUS_LABEL
+
     def _refresh_queue(self) -> None:
         table = self.query_one("#queue-table", DataTable)
         cursor = table.cursor_coordinate
         table.clear()
+        priority_label, status_label = self._labels
         for row in self.db.list_jobs():
             table.add_row(
                 str(row["id"]),
                 row["name"],
                 row["filament_type"],
-                PRIORITY_LABEL.get(row["priority"], row["priority"]),
-                STATUS_LABEL.get(row["status"], row["status"]),
+                priority_label.get(row["priority"], row["priority"]),
+                status_label.get(row["status"], row["status"]),
                 f"{row['estimated_minutes']}m" if row["estimated_minutes"] else "—",
                 key=str(row["id"]),
             )
@@ -311,12 +427,13 @@ class PrintQueueApp(App):
     def _refresh_history(self) -> None:
         table = self.query_one("#history-table", DataTable)
         table.clear()
+        _, status_label = self._labels
         for row in self.db.list_history(limit=20):
             when = utc_to_local_str(row["finished_at"], "%m-%d %H:%M")
             table.add_row(
                 str(when),
                 row["job_name"],
-                STATUS_LABEL.get(row["status"], row["status"]),
+                status_label.get(row["status"], row["status"]),
                 f"{row['grams_used']:.0f}g" if row["grams_used"] else "—",
                 f"{row['minutes_taken']}" if row["minutes_taken"] else "—",
                 key=f"h{row['id']}",
@@ -379,6 +496,32 @@ class PrintQueueApp(App):
         self._pending_delete = (job_id, time.monotonic())
         self.notify(f"Press x again to delete job {job_id}", severity="warning")
 
+    def action_cycle_theme(self) -> None:
+        """Cycle stock → c64 → wildcat (Ctrl+P offers the full theme list)."""
+        names = ["textual-dark", *RETRO_THEMES]
+        idx = (names.index(self.theme) + 1) % len(names) if self.theme in names else 1
+        self.theme = names[idx]
+        self.notify(f"Theme: {self.theme}", timeout=2)
+
+    def _on_theme_changed(self, theme) -> None:
+        """Restyle after any theme change (palette, `t` key, or startup).
+
+        Textual refreshes the CSS itself; we toggle the retro overrides and
+        re-render the markup/labels, then persist the choice.
+        """
+        self.screen.set_class(theme.name in RETRO_THEMES, "pq-themed")
+        self.query_one(PrinterPanel).refresh()
+        for panel in self.query(TitledPanel):
+            panel.refresh_title()
+        self.refresh_tables()       # re-render labels (emoji vs ASCII)
+        if self.cfg is not None and self.cfg.theme != theme.name:
+            try:
+                from .config import save_config
+                self.cfg.theme = theme.name
+                save_config(self.cfg)
+            except Exception:
+                pass  # cosmetic preference — never break the UI over it
+
     # -- camera ---------------------------------------------------------------
     def action_toggle_camera(self) -> None:
         cam = self.query_one(CameraPanel)
@@ -392,7 +535,7 @@ class PrintQueueApp(App):
             return
         cam.display = True
         printer.styles.width = "24%"
-        cam.show_status("[bold cyan]Camera[/bold cyan]\n\n  connecting…")
+        cam.show_status(f"{self.pq_markup.title('Camera')}\n\n  connecting…")
         self.run_worker(self._start_camera, thread=True, exclusive=True,
                         group="camera")
 
@@ -413,7 +556,8 @@ class PrintQueueApp(App):
 
     def _camera_failed(self, msg: str) -> None:
         cam = self.query_one(CameraPanel)
-        cam.show_status(f"[bold cyan]Camera[/bold cyan]\n\n  [red]✗[/red] {msg}")
+        cam.show_status(f"{self.pq_markup.title('Camera')}\n\n"
+                        f"  [{self.pq_markup.err_style}]✗[/] {msg}")
         self.notify("Camera unavailable", severity="warning")
 
     def _update_camera(self) -> None:
@@ -425,14 +569,15 @@ class PrintQueueApp(App):
         frame = stream.frame
         if frame is None:
             if stream.error:
-                cam.show_status(f"[bold cyan]Camera[/bold cyan]\n\n"
-                                f"  [red]✗[/red] {stream.error}")
+                cam.show_status(f"{self.pq_markup.title('Camera')}\n\n"
+                                f"  [{self.pq_markup.err_style}]✗[/] {stream.error}")
             return
         if stream._frame_ts == self._camera_frame_ts:
             return  # nothing new
         if CameraImageWidget is None:
-            cam.show_status("[bold cyan]Camera[/bold cyan]\n\n"
-                            "  [red]✗[/red] textual-image not installed")
+            cam.show_status(f"{self.pq_markup.title('Camera')}\n\n"
+                            f"  [{self.pq_markup.err_style}]✗[/] "
+                            "textual-image not installed")
             return
         import io
         self._camera_frame_ts = stream._frame_ts
@@ -454,5 +599,6 @@ class PrintQueueApp(App):
         self.notify(f"AMS synced: {len(results)} tray(s), {added} new spool(s)")
 
 
-def run_dashboard(db: Database, client: BambuCloudClient, cfg=None) -> None:
-    PrintQueueApp(db=db, client=client, cfg=cfg).run()
+def run_dashboard(db: Database, client: BambuCloudClient, cfg=None,
+                  theme_name: Optional[str] = None) -> None:
+    PrintQueueApp(db=db, client=client, cfg=cfg, theme_name=theme_name).run()
